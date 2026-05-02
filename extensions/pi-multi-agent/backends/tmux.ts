@@ -32,10 +32,17 @@ interface TmuxPane {
 
 /** Get the current (main) pane ID — call BEFORE any splits. */
 async function getMainPaneId(): Promise<string> {
-  const { stdout } = await execFileP("tmux", [
-    "display-message", "-p", "#{pane_id}",
-  ]);
-  return stdout.trim();
+  try {
+    const { stdout } = await execFileP("tmux", [
+      "display-message", "-p", "#{pane_id}",
+    ]);
+    const id = stdout.trim();
+    console.error(`[pi-multi-agent] Main pane ID: ${id}`);
+    return id;
+  } catch (e: any) {
+    console.error(`[pi-multi-agent] Failed to get main pane ID: ${e.message}`);
+    throw e;
+  }
 }
 
 /** Select a specific pane, making it active. */
@@ -64,6 +71,8 @@ async function spawnPane(
   ];
 
   const { stdout: paneId } = await execFileP("tmux", args);
+  const newId = paneId.trim();
+  console.error(`[pi-multi-agent] Spawned pane ${newId} for "${label}" (split from ${mainPaneId})`);
 
   if (index > 0) {
     try { await execFileP("tmux", ["select-layout", "tiled"]); } catch {}
@@ -72,15 +81,16 @@ async function spawnPane(
   // Select back to main pane so next split is from the right place
   await selectPane(mainPaneId);
 
-  return { paneId: paneId.trim(), label };
+  return { paneId: newId, label };
 }
 
 /** Kill a pane by ID. Never kills the main pane. */
-async function killPane(paneId: string, mainPaneId: string): Promise<void> {
+async function killPane(paneId: string, mainPaneId: string, label?: string): Promise<void> {
   if (paneId === mainPaneId) {
-    console.error("[pi-multi-agent] Refusing to kill main pane");
+    console.error(`[pi-multi-agent] Refusing to kill main pane ${mainPaneId} (task: ${label ?? "?"})`);
     return;
   }
+  console.error(`[pi-multi-agent] Killing pane ${paneId} (task: ${label ?? "?"})`);
   try { await execFileP("tmux", ["kill-pane", "-t", paneId]); } catch {}
 }
 
@@ -318,7 +328,7 @@ export async function executeTmuxPrint(
           .trim();
       }
 
-      await killPane(paneId, mainPaneId);
+      await killPane(paneId, mainPaneId, task.role ?? taskId);
 
       results.push({
         taskId: task.id,
@@ -334,7 +344,7 @@ export async function executeTmuxPrint(
   } finally {
     // Cleanup any remaining panes (should be none, but be safe)
     for (const { paneId } of panes) {
-      try { await killPane(paneId, mainPaneId); } catch {}
+      try { await killPane(paneId, mainPaneId, task.role ?? taskId); } catch {}
     }
     // Ensure we're back in main pane
     try { await selectPane(mainPaneId); } catch {}
@@ -419,7 +429,7 @@ export async function executeTmuxRpc(
           .trim();
       }
 
-      await killPane(paneId, mainPaneId);
+      await killPane(paneId, mainPaneId, task.role ?? taskId);
 
       results.push({
         taskId: task.id,
@@ -434,7 +444,7 @@ export async function executeTmuxRpc(
     return results;
   } finally {
     for (const { paneId } of panes) {
-      try { await killPane(paneId, mainPaneId); } catch {}
+      try { await killPane(paneId, mainPaneId, task.role ?? taskId); } catch {}
     }
     try { await selectPane(mainPaneId); } catch {}
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
