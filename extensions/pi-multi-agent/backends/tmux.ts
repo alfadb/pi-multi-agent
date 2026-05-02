@@ -151,7 +151,20 @@ function buildPiCmd(
   subMode: "print" | "rpc",
   stdinFile?: string,
 ): string {
-  const envVars = `export ${resolved.provider.toUpperCase()}_API_KEY="${resolved.apiKey}"`;
+  // Escape API key for bash: wrap in single quotes, escape internal single quotes
+  const safeKey = resolved.apiKey.replace(/'/g, `'\\''`);
+  const envVars = `export ${resolved.provider.toUpperCase()}_API_KEY='${safeKey}'`;
+
+  // Use absolute path to pi — new panes may not have the same PATH.
+  // Detect at runtime from the main process's environment.
+  const piPath = (() => {
+    const paths = (process.env.PATH || "").split(":");
+    for (const p of paths) {
+      const candidate = path.join(p, "pi");
+      try { if (fs.existsSync(candidate)) return candidate; } catch {}
+    }
+    return "pi"; // fallback
+  })();
 
   const args = [
     "--model", `${resolved.provider}/${resolved.modelId}`,
@@ -164,10 +177,10 @@ function buildPiCmd(
 
   if (subMode === "print") {
     args.push("--print");
-    return `${envVars} && pi ${args.join(" ")} < '${stdinFile}'`;
+    return `${envVars} && ${piPath} ${args.join(" ")} < '${stdinFile}'`;
   } else {
     args.push("--mode", "rpc");
-    return `${envVars} && pi ${args.join(" ")} < '${stdinFile}'`;
+    return `${envVars} && ${piPath} ${args.join(" ")} < '${stdinFile}'`;
   }
 }
 
