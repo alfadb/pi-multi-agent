@@ -313,4 +313,182 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
+
+  // ── imagine — AI image generation via DALL-E ─────────────────
+
+  pi.registerTool({
+    name: "imagine",
+    label: "AI Image Generation",
+    description:
+      "Generate images using DALL-E 3. Call when the user asks to create, generate, " +
+      "or draw an image. Supports size (1024x1024, 1792x1024, 1024x1792), quality " +
+      "(standard, hd), and style (vivid, natural).",
+    promptSnippet: "Generate image: imagine(prompt, size?, quality?)",
+    promptGuidelines: [
+      "Use imagine when the user asks for image generation, illustration, or visual creation.",
+      "Default quality is hd, default size is 1024x1024.",
+      "The tool returns a URL to the generated image.",
+    ],
+    parameters: Type.Object({
+      prompt: Type.String({ description: "Image description/prompt" }),
+      size: Type.Optional(Type.String({ description: "1024x1024, 1792x1024, or 1024x1792" })),
+      quality: Type.Optional(Type.String({ description: "standard or hd (default)" })),
+      style: Type.Optional(Type.String({ description: "vivid or natural (default)" })),
+    }),
+
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+        // Resolve OpenAI API key
+        const openaiModel = ctx.modelRegistry.find("openai", "gpt-4.1-mini");
+        if (!openaiModel) {
+          return { content: [{ type: "text", text: "OpenAI provider not configured. Add to models.json." }], isError: true };
+        }
+        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(openaiModel);
+        if (!auth.ok || !auth.apiKey) {
+          return { content: [{ type: "text", text: `OpenAI auth failed: ${auth.error || "no key"}` }], isError: true };
+        }
+
+        const baseUrl = openaiModel.baseUrl || "https://api.openai.com";
+        const response = await fetch(`${baseUrl.replace(/\/v1\/?$/, "")}/v1/images/generations`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${auth.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: "dall-e-3",
+            prompt: params.prompt,
+            n: 1,
+            size: params.size || "1024x1024",
+            quality: params.quality || "hd",
+            style: params.style || "natural",
+          }),
+        });
+
+        if (!response.ok) {
+          const err = await response.text().catch(() => "unknown");
+          return { content: [{ type: "text", text: `Image generation failed: ${response.status} ${err.slice(0, 500)}` }], isError: true };
+        }
+
+        const data = await response.json() as any;
+        const imageUrl = data?.data?.[0]?.url;
+        if (!imageUrl) {
+          return { content: [{ type: "text", text: "No image URL in response." }], isError: true };
+        }
+
+        // Fetch the image to return as base64 so the LLM can see it
+        const imgResp = await fetch(imageUrl);
+        if (!imgResp.ok) {
+          return { content: [{ type: "text", text: `Generated: ${imageUrl}` }] };
+        }
+        const buffer = Buffer.from(await imgResp.arrayBuffer());
+        const mimeType = imgResp.headers.get("content-type") || "image/png";
+        const base64 = buffer.toString("base64");
+
+        return {
+          content: [
+            { type: "text", text: `✅ Generated image (${params.size || "1024x1024"}, ${params.quality || "hd"})` },
+            { type: "image", data: base64, mimeType },
+          ],
+          details: { url: imageUrl, size: params.size, quality: params.quality },
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `Image generation error: ${e?.message || String(e)}` }], isError: true };
+      }
+    },
+  });
+
+  // ── vision — auto-delegate image analysis to best vision model ─
+
+  pi.registerTool({
+    name: "vision",
+    label: "Vision Delegate",
+    description:
+      "Analyze images using the best available vision model. Use when the current model " +
+      "does not support image input, or when you want a dedicated vision model for image analysis. " +
+      "Automatically selects the strongest available vision-capable model.",
+    promptSnippet: "Analyze image: vision(imageBase64, prompt)",
+    promptGuidelines: [
+      "Use vision when the user provides an image (screenshot, photo, diagram) and the current model cannot process images.",
+      "The tool auto-selects the best vision model available: gpt-5.5-pro > gpt-5.5 > claude-opus-4-7 > gpt-4.1.",
+      "Returns the text analysis from the vision model.",
+    ],
+    parameters: Type.Object({
+      imageBase64: Type.String({ description: "Base64 encoded image data" }),
+      mimeType: Type.Optional(Type.String({ description: "Image MIME type, e.g. image/png" })),
+      prompt: Type.String({ description: "What to analyze/look for in the image" }),
+    }),
+
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+        // Check if current model already supports images — if so, suggest the LLM do it directly
+        if (ctx.model?.input?.includes("image")) {
+          return {
+            content: [{ type: "text", text: "Current model supports images directly. No delegation needed. Describe the image in your prompt." }],
+          };
+        }
+
+        // Find best vision model
+        const visionModels = (await ctx.modelRegistry.getAvailable())
+          .filter((m: any) => m.input?.includes("image"))
+          .sort((a: any, b: any) => {
+            const rank = (m: any) => {
+              const id = m.id.toLowerCase();
+              if (m.provider === "openai" && id.includes("gpt-5.5-pro")) return 10;
+              if (m.provider === "openai" && id.includes("gpt-5.5")) return 9;
+              if (m.provider === "anthropic" && id.includes("opus-4-7")) return 8;
+              if (m.provider === "openai" && id.includes("gpt-5")) return 7;
+              if (m.provider === "anthropic" && id.includes("opus")) return 6;
+              if (m.provider === "openai" && id.includes("gpt-4.1")) return 5;
+              if (m.provider === "anthropic" && id.includes("sonnet")) return 4;
+              return 0;
+            };
+            return rank(b) - rank(a);
+          });
+
+        if (visionModels.length === 0) {
+          return { content: [{ type: "text", text: "No vision-capable model available. Configure OpenAI or Anthropic with image support." }], isError: true };
+        }
+
+        const bestVision = visionModels[0];
+        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(bestVision);
+        if (!auth.ok || !auth.apiKey) {
+          return { content: [{ type: "text", text: `Auth failed for vision model: ${auth.error || "no key"}` }], isError: true };
+        }
+
+        // Call the vision model via completeSimple
+        const { completeSimple } = await import("@mariozechner/pi-ai");
+        const response = await completeSimple(
+          bestVision,
+          {
+            messages: [{
+              role: "user",
+              content: [
+                { type: "text", text: params.prompt },
+                { type: "image", data: params.imageBase64, mimeType: params.mimeType || "image/png" },
+              ],
+              timestamp: Date.now(),
+            }],
+          },
+          {
+            apiKey: auth.apiKey,
+            headers: auth.headers,
+            maxTokens: 4096,
+          },
+        );
+
+        const text = response.content
+          .filter((c: any) => c.type === "text")
+          .map((c: any) => c.text)
+          .join("\n");
+
+        return {
+          content: [{ type: "text", text: `## Vision Analysis (${bestVision.provider}/${bestVision.id})\n\n${text}` }],
+          details: { model: `${bestVision.provider}/${bestVision.id}` },
+        };
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `Vision analysis error: ${e?.message || String(e)}` }], isError: true };
+      }
+    },
+  });
 }
