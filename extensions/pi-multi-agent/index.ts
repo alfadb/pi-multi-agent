@@ -334,7 +334,7 @@ export default function (pi: ExtensionAPI) {
       model: Type.Optional(Type.String({ description: "Image model: gpt-image-2 (default, latest), dall-e-3, dall-e-2" })),
       size: Type.Optional(Type.String({ description: "1024x1024, 1792x1024, or 1024x1792" })),
       quality: Type.Optional(Type.String({ description: "standard or hd (default)" })),
-      style: Type.Optional(Type.String({ description: "vivid or natural (default)" })),
+      style: Type.Optional(Type.String({ description: "vivid or natural (via prompt, not API param)" })),
     }),
 
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -349,8 +349,10 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `OpenAI auth failed: ${auth.error || "no key"}` }], isError: true };
         }
 
+        // Call gpt-image-2 via Responses API (not Images API — sub2api doesn't support that)
         const baseUrl = openaiModel.baseUrl || "https://api.openai.com";
-        const response = await fetch(`${baseUrl.replace(/\/v1\/?$/, "")}/v1/images/generations`, {
+        const cleanBase = baseUrl.replace(/\/v1\/?$/, "");
+        const response = await fetch(`${cleanBase}/v1/responses`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -358,11 +360,12 @@ export default function (pi: ExtensionAPI) {
           },
           body: JSON.stringify({
             model: params.model || "gpt-image-2",
-            prompt: params.prompt,
-            n: 1,
-            size: params.size || "1024x1024",
-            quality: params.quality || "hd",
-            style: params.style || "natural",
+            input: params.prompt,
+            image_generation: {
+              quality: params.quality || "hd",
+              size: params.size || "1024x1024",
+              output_format: "png",
+            },
           }),
         });
 
@@ -372,26 +375,26 @@ export default function (pi: ExtensionAPI) {
         }
 
         const data = await response.json() as any;
-        const imageUrl = data?.data?.[0]?.url;
-        if (!imageUrl) {
-          return { content: [{ type: "text", text: "No image URL in response." }], isError: true };
+
+        // Extract base64 image from Responses API output
+        let imageBase64 = "";
+        for (const item of data?.output ?? []) {
+          if (item.type === "image_generation_call" && item.result) {
+            imageBase64 = item.result;
+            break;
+          }
         }
 
-        // Fetch the image to return as base64 so the LLM can see it
-        const imgResp = await fetch(imageUrl);
-        if (!imgResp.ok) {
-          return { content: [{ type: "text", text: `Generated: ${imageUrl}` }] };
+        if (!imageBase64) {
+          return { content: [{ type: "text", text: "No image in response. Model may not support image generation." }], isError: true };
         }
-        const buffer = Buffer.from(await imgResp.arrayBuffer());
-        const mimeType = imgResp.headers.get("content-type") || "image/png";
-        const base64 = buffer.toString("base64");
 
         return {
           content: [
-            { type: "text", text: `✅ Generated image (${params.size || "1024x1024"}, ${params.quality || "hd"})` },
-            { type: "image", data: base64, mimeType },
+            { type: "text", text: `✅ Generated (${params.model || "gpt-image-2"}, ${params.size || "1024x1024"}, ${params.quality || "hd"})` },
+            { type: "image", data: imageBase64, mimeType: "image/png" },
           ],
-          details: { url: imageUrl, size: params.size, quality: params.quality },
+          details: { model: params.model || "gpt-image-2", size: params.size, quality: params.quality },
         };
       } catch (e: any) {
         return { content: [{ type: "text", text: `Image generation error: ${e?.message || String(e)}` }], isError: true };
