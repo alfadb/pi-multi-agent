@@ -2,21 +2,25 @@
 
 调用 `multi_dispatch` 以 ensemble 策略让多个模型独立回答同一问题，再综合择优。
 
+## 模型选择
+
+先执行 `pi --list-models` 确认可用模型。选择 2-3 个不同类型的最强可用模型（如 deepseek + openai + anthropic 各一个），以最大化视角多样性。thinking 统一 `xhigh`。
+
 ## 执行
 
 ```
 multi_dispatch(
   strategy="ensemble",
   tasks=[
-    {id:"a", model:"openai/gpt-5.5-pro", thinking:"xhigh",
+    {id:"a", model:"<按原则选择>", thinking:"xhigh",
      prompt:"{QUESTION}"},
-    {id:"b", model:"anthropic/claude-sonnet-4", thinking:"xhigh",
+    {id:"b", model:"<按原则选择>", thinking:"xhigh",
      prompt:"{QUESTION}"},
-    {id:"c", model:"deepseek/deepseek-v4-pro", thinking:"xhigh",
+    {id:"c", model:"<按原则选择>", thinking:"xhigh",
      prompt:"{QUESTION}"},
   ],
   options={
-    synthesisModel: "{SYNTHESIS_MODEL}",
+    synthesisModel: "<按原则选择综合模型>",
     synthesisThinking: "xhigh"
   }
 )
@@ -25,7 +29,6 @@ multi_dispatch(
 ## 变量
 
 - `{QUESTION}`：待回答的问题
-- `{SYNTHESIS_MODEL}`：综合模型
 
 ## 结果
 
