@@ -22,7 +22,7 @@ multi_dispatch(
 —— diff ——
 {DIFF}"},
 
-    {id:"security", model:"anthropic/claude-sonnet-4", thinking:"xhigh",
+    {id:"security", model:"anthropic/claude-opus-4-7", thinking:"xhigh",
      prompt:"严格遵循以下 checklist 审查这个 diff 的安全问题。每项发现标注严重度、置信度、文件:行号。
 
 —— checklist ——
@@ -37,7 +37,7 @@ multi_dispatch(
 —— diff ——
 {DIFF}"},
 
-    {id:"maintainability", model:"anthropic/claude-sonnet-4", thinking:"high",
+    {id:"maintainability", model:"anthropic/claude-opus-4-7", thinking:"high",
      prompt:"严格遵循以下 checklist 审查这个 diff 的可维护性。每项发现标注严重度、置信度、文件:行号。
 
 —— checklist ——
