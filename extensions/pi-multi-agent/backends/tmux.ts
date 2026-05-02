@@ -30,36 +30,62 @@ interface TmuxPane {
   label: string;
 }
 
-/** Split a new pane, run a command, return its ID. */
+/** Get the current (main) pane ID — call BEFORE any splits. */
+async function getMainPaneId(): Promise<string> {
+  const { stdout } = await execFileP("tmux", [
+    "display-message", "-p", "#{pane_id}",
+  ]);
+  return stdout.trim();
+}
+
+/** Select a specific pane, making it active. */
+async function selectPane(paneId: string): Promise<void> {
+  await execFileP("tmux", ["select-pane", "-t", paneId]);
+}
+
+/** Split a new pane from the main pane, run a command, return its ID. */
 async function spawnPane(
+  mainPaneId: string,
   label: string,
   command: string,
-  isFirst: boolean,
+  index: number,
 ): Promise<TmuxPane> {
+  // Always select main pane first so splits are from the right place
+  await selectPane(mainPaneId);
+
   // Escape single quotes in command for bash -c
   const safeCmd = command.replace(/'/g, `'\\''`);
 
-  if (isFirst) {
+  if (index === 0) {
     await execFileP("tmux", [
-      "split-window", "-h", "-l", "80",
+      "split-window", "-t", mainPaneId, "-h", "-l", "80",
       "bash", "-c", safeCmd,
     ]);
   } else {
     await execFileP("tmux", [
-      "split-window", "-v", "-l", "15",
+      "split-window", "-t", mainPaneId, "-v", "-l", "15",
       "bash", "-c", safeCmd,
     ]);
     try { await execFileP("tmux", ["select-layout", "tiled"]); } catch {}
   }
 
+  // After split, the new pane is active — capture its ID
   const { stdout: paneId } = await execFileP("tmux", [
     "display-message", "-p", "#{pane_id}",
   ]);
+
+  // Select back to main pane so next split is from the right place
+  await selectPane(mainPaneId);
+
   return { paneId: paneId.trim(), label };
 }
 
-/** Kill a pane by ID. */
-async function killPane(paneId: string): Promise<void> {
+/** Kill a pane by ID. Never kills the main pane. */
+async function killPane(paneId: string, mainPaneId: string): Promise<void> {
+  if (paneId === mainPaneId) {
+    console.error("[pi-multi-agent] Refusing to kill main pane");
+    return;
+  }
   try { await execFileP("tmux", ["kill-pane", "-t", paneId]); } catch {}
 }
 
@@ -240,11 +266,13 @@ export async function executeTmuxPrint(
   const panes: { taskId: string; paneId: string }[] = [];
   const results: TaskResult[] = [];
 
+  // Save main pane ID BEFORE any splits
+  const mainPaneId = await getMainPaneId();
+
   try {
     // Spawn panes
-    let isFirst = true;
-
-    for (const task of tasks) {
+    for (let i = 0; i < tasks.length; i++) {
+      const task = tasks[i];
       const resolved = resolvedModels.get(task.id);
       if (!resolved) {
         results.push({
@@ -254,19 +282,19 @@ export async function executeTmuxPrint(
         continue;
       }
 
-      // Write prompt file
       const promptFile = path.join(tmpDir, `${task.id}-prompt.md`);
       fs.writeFileSync(promptFile, task.prompt, "utf8");
 
-      // Build command with completion marker
       const piCmd = buildPiCmd(resolved, task, opts.extraFlags, "print", promptFile);
       const label = task.role ?? task.id;
       const fullCmd = `echo '=== START:${task.id} ===' && ${piCmd}; echo ''; echo '=== DONE:${task.id} ==='; echo 'Press Enter to close...'; read`;
 
-      const pane = await spawnPane(label, fullCmd, isFirst);
+      const pane = await spawnPane(mainPaneId, label, fullCmd, i);
       panes.push({ taskId: task.id, paneId: pane.paneId });
-      isFirst = false;
     }
+
+    // Select back to main pane for safety
+    await selectPane(mainPaneId);
 
     // Wait for all panes to complete
     for (const { taskId, paneId } of panes) {
@@ -287,7 +315,6 @@ export async function executeTmuxPrint(
         }
       } else {
         error = `Timed out after ${opts.taskTimeoutMs}ms`;
-        // Try final capture
         const final = await capturePane(paneId);
         output = final
           .replace(new RegExp(`=== START:${taskId} ===`, "g"), "")
@@ -296,7 +323,7 @@ export async function executeTmuxPrint(
           .trim();
       }
 
-      await killPane(paneId);
+      await killPane(paneId, mainPaneId);
 
       results.push({
         taskId: task.id,
@@ -310,11 +337,12 @@ export async function executeTmuxPrint(
 
     return results;
   } finally {
-    // Cleanup any remaining panes
+    // Cleanup any remaining panes (should be none, but be safe)
     for (const { paneId } of panes) {
-      try { await killPane(paneId); } catch {}
+      try { await killPane(paneId, mainPaneId); } catch {}
     }
-    try { await execFileP("tmux", ["select-pane", "-t", "0"]); } catch {}
+    // Ensure we're back in main pane
+    try { await selectPane(mainPaneId); } catch {}
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 }
@@ -329,7 +357,7 @@ export async function executeTmuxPrint(
 export async function executeTmuxRpc(
   tasks: Task[],
   resolvedModels: Map<string, ResolvedModel>,
-  roundsPerTask: Map<string, string[]>, // taskId → round prompts
+  roundsPerTask: Map<string, string[]>,
   opts: TmuxBackendOptions,
 ): Promise<TaskResult[]> {
   const start = Date.now();
@@ -337,10 +365,11 @@ export async function executeTmuxRpc(
   const panes: { taskId: string; paneId: string }[] = [];
   const results: TaskResult[] = [];
 
-  try {
-    let isFirst = true;
+  const mainPaneId = await getMainPaneId();
 
-    for (const task of tasks) {
+  try {
+    for (let i = 0; i < tasks.length; i++) {
+      const task = tasks[i];
       const resolved = resolvedModels.get(task.id);
       if (!resolved) {
         results.push({
@@ -354,7 +383,6 @@ export async function executeTmuxRpc(
       const rpcRounds: RpcRound[] = roundPrompts.map((p) => ({ prompt: p }));
       const rpcFile = buildRpcCommandFile(task.id, rpcRounds, tmpDir);
 
-      // Build command: run pi in RPC mode, capture all output
       const piCmd = buildPiCmd(resolved, task, opts.extraFlags, "rpc", rpcFile);
       const label = task.role ?? task.id;
       const fullCmd =
@@ -362,12 +390,12 @@ export async function executeTmuxRpc(
         `echo ''; echo '=== DONE:${task.id} ==='; ` +
         `echo 'Press Enter to close...'; read`;
 
-      const pane = await spawnPane(label, fullCmd, isFirst);
+      const pane = await spawnPane(mainPaneId, label, fullCmd, i);
       panes.push({ taskId: task.id, paneId: pane.paneId });
-      isFirst = false;
     }
 
-    // Wait for all panes, parse multi-round output
+    await selectPane(mainPaneId);
+
     for (const { taskId, paneId } of panes) {
       const task = tasks.find((t) => t.id === taskId)!;
       const marker = `=== DONE:${taskId} ===`;
@@ -383,10 +411,9 @@ export async function executeTmuxRpc(
           ? raw.slice(startIdx + `=== START:${taskId} ===`.length, endIdx)
           : raw.slice(0, raw.indexOf(marker));
 
-        // Parse RPC events to extract multi-round output
         const rounds = parseRpcOutput(body);
         output = rounds.length > 0
-          ? rounds.map((r, i) => `## Round ${i + 1}\n\n${r}`).join("\n\n---\n\n")
+          ? rounds.map((r, j) => `## Round ${j + 1}\n\n${r}`).join("\n\n---\n\n")
           : body.trim();
       } else {
         error = `Timed out after ${opts.taskTimeoutMs}ms`;
@@ -397,7 +424,7 @@ export async function executeTmuxRpc(
           .trim();
       }
 
-      await killPane(paneId);
+      await killPane(paneId, mainPaneId);
 
       results.push({
         taskId: task.id,
@@ -412,9 +439,9 @@ export async function executeTmuxRpc(
     return results;
   } finally {
     for (const { paneId } of panes) {
-      try { await killPane(paneId); } catch {}
+      try { await killPane(paneId, mainPaneId); } catch {}
     }
-    try { await execFileP("tmux", ["select-pane", "-t", "0"]); } catch {}
+    try { await selectPane(mainPaneId); } catch {}
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 }
