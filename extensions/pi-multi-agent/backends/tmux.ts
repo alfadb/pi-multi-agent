@@ -68,15 +68,18 @@ async function executeOneInPane(
     // Write prompt to file
     fs.writeFileSync(promptFile, task.prompt, "utf8");
 
-    // Build the command to run (will be sent via send-keys)
+    // Build the command — write to temp file, then source it to avoid shell echo
     const markerPrefix = `PI_MA_${task.id}_`;
-    const piCmd = [
+    const cmdFile = path.join(tmpDir, "cmd.sh");
+    fs.writeFileSync(cmdFile, [
       `echo "${markerPrefix}START"`,
       `${piPath} --model ${task.model} --thinking ${task.thinking} --print --no-session ${opts.extraFlags.join(" ")} < '${promptFile}'`,
-      `echo "${markerPrefix}EXIT:$?"`,
+      `RC=$?`,
+      `echo "${markerPrefix}EXIT:$RC"`,
       `echo "${markerPrefix}DONE"`,
       `echo "done" > '${exitFile}'`,
-    ].join(" && ");
+    ].join("\n"), "utf8");
+    fs.chmodSync(cmdFile, 0o755);
 
     // ── Step 1: Split pane (user's shell, no command) ──
     const splitArgs = index === 0
@@ -85,9 +88,8 @@ async function executeOneInPane(
 
     paneId = tmux(splitArgs);
 
-    // ── Step 2: Send-keys to inject command ──
-    // Send the command character by character to the pane's shell
-    tmux(["send-keys", "-t", paneId, "-l", piCmd]);
+    // ── Step 2: Source the temp script (sends a minimal command to shell) ──
+    tmux(["send-keys", "-t", paneId, "-l", `source '${cmdFile}'`]);
     tmux(["send-keys", "-t", paneId, "Enter"]);
 
     // ── Poll for exit file ──
