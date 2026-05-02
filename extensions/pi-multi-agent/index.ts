@@ -23,7 +23,6 @@ import { executeDebate } from "./strategies/debate.js";
 import { executeChain } from "./strategies/chain.js";
 import { executeEnsemble } from "./strategies/ensemble.js";
 import { cleanupRpcSessions } from "./backends/rpc.js";
-import { executeTmux, isTmuxAvailable } from "./backends/tmux.js";
 
 // ── Tool schema ──────────────────────────────────────────────────
 
@@ -55,7 +54,7 @@ const DispatchOptionsSchema = Type.Object({
     Type.String({ description: "Thinking level for synthesis" }),
   ),
   executionMode: Type.Optional(
-    Type.String({ description: "Override execution mode: print, rpc, tmux, sdk" }),
+    Type.String({ description: "Override execution mode: print, rpc, sdk" }),
   ),
   taskTimeoutMs: Type.Optional(
     Type.Number({ description: "Per-task timeout in ms (default 300000)" }),
@@ -105,22 +104,6 @@ async function resolveModels(
 
 // ── Mode resolution ─────────────────────────────────────────────
 
-async function resolveMode(
-  explicitMode: ExecutionMode | undefined,
-  strategy: Strategy,
-): Promise<ExecutionMode> {
-  // If user explicitly requested a mode, use it
-  if (explicitMode) {
-    if (explicitMode === "tmux" && !(await isTmuxAvailable())) {
-      console.log("[pi-multi-agent] tmux not available, falling back to print");
-      return "print";
-    }
-    return explicitMode;
-  }
-  // Default: use strategy's default mode
-  return DEFAULT_CONFIG.strategyModes[strategy];
-}
-
 
 // ── Strategy dispatch ────────────────────────────────────────────
 
@@ -136,21 +119,13 @@ async function dispatch(
 
   const start = Date.now();
 
-  // Resolve actual execution mode: explicit override > tmux if available > default
-  const effectiveMode = await resolveMode(opts.executionMode, strategy);
+  // Use explicit mode override, or strategy default
+  const effectiveMode = opts.executionMode ?? DEFAULT_CONFIG.strategyModes[strategy];
   const dispatchOpts = { ...config, executionMode: effectiveMode };
 
   switch (strategy) {
     case "parallel": {
-      let taskResults: TaskResult[];
-      if (effectiveMode === "tmux") {
-        taskResults = await executeTmux(tasks, resolvedModels, {
-          taskTimeoutMs: config.timeoutMs,
-          extraFlags: config.extraFlags,
-        });
-      } else {
-        taskResults = await executeParallel(tasks, resolvedModels, dispatchOpts);
-      }
+      const taskResults = await executeParallel(tasks, resolvedModels, dispatchOpts);
       return {
         strategy,
         executionMode: effectiveMode,
@@ -160,33 +135,18 @@ async function dispatch(
     }
 
     case "debate": {
-      if (effectiveMode === "tmux") {
-        console.log("[pi-multi-agent] tmux not supported for debate (use pi-side-agents for interactive multi-turn). Falling back to rpc.");
-      }
-      const debateMode = effectiveMode === "tmux" ? "rpc" : effectiveMode;
-      const debateOpts = { ...dispatchOpts, executionMode: debateMode };
-      const { taskResults: dr, synthesis: ds } = await executeDebate(tasks, resolvedModels, debateOpts);
-      return { strategy, executionMode: debateMode, tasks: dr, synthesis: ds, totalDurationMs: Date.now() - start };
+      const { taskResults, synthesis } = await executeDebate(tasks, resolvedModels, dispatchOpts);
+      return { strategy, executionMode: effectiveMode, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
     }
 
     case "chain": {
-      if (effectiveMode === "tmux") {
-        console.log("[pi-multi-agent] tmux not supported for chain. Falling back to rpc.");
-      }
-      const chainMode = effectiveMode === "tmux" ? "rpc" : effectiveMode;
-      const chainOpts = { ...dispatchOpts, executionMode: chainMode };
-      const taskResults = await executeChain(tasks, resolvedModels, chainOpts);
-      return { strategy, executionMode: chainMode, tasks: taskResults, totalDurationMs: Date.now() - start };
+      const taskResults = await executeChain(tasks, resolvedModels, dispatchOpts);
+      return { strategy, executionMode: effectiveMode, tasks: taskResults, totalDurationMs: Date.now() - start };
     }
 
     case "ensemble": {
-      if (effectiveMode === "tmux") {
-        console.log("[pi-multi-agent] tmux not supported for ensemble. Falling back to print.");
-      }
-      const ensMode = effectiveMode === "tmux" ? "print" : effectiveMode;
-      const ensOpts = { ...dispatchOpts, executionMode: ensMode };
-      const { taskResults: er, synthesis: es } = await executeEnsemble(tasks, resolvedModels, ensOpts);
-      return { strategy, executionMode: ensMode, tasks: er, synthesis: es, totalDurationMs: Date.now() - start };
+      const { taskResults, synthesis } = await executeEnsemble(tasks, resolvedModels, dispatchOpts);
+      return { strategy, executionMode: effectiveMode, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
     }
 
     default:
@@ -258,7 +218,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Execute multiple AI tasks in parallel, debate, chain, or ensemble mode. " +
       "Each task can use a different model and thinking level. " +
-      "Backends: print (headless), rpc (multi-turn), tmux (visible panes). " +
+      "Backends: print (headless), rpc (multi-turn). " +
       "Use for: parallel code review, multi-expert design debate, chain coding, ensemble decision-making.",
     promptSnippet:
       "multi_dispatch(strategy, tasks[], options?) — spawn parallel sub-agents with different models",

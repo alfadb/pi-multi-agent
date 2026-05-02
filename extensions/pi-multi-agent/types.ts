@@ -22,7 +22,7 @@ export interface Task {
 export type Strategy = "parallel" | "debate" | "chain" | "ensemble";
 
 /** Backend determines the execution mechanism. */
-export type ExecutionMode = "print" | "rpc" | "tmux" | "sdk";
+export type ExecutionMode = "print" | "rpc" | "sdk";
 
 /** Options controlling the overall dispatch. */
 export interface DispatchOptions {
