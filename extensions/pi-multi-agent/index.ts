@@ -207,6 +207,13 @@ export default function (pi: ExtensionAPI) {
     cleanupRpcSessions();
   });
 
+  // Persistent status bar icon
+  pi.on("session_start", async (_event, ctx) => {
+    if (ctx.hasUI) {
+      try { ctx.ui.setStatus("multi-agent", "🤖 multi-agent"); } catch {}
+    }
+  });
+
   pi.registerTool({
     name: "multi_dispatch",
     label: "Multi-Agent Dispatch",
@@ -270,7 +277,7 @@ export default function (pi: ExtensionAPI) {
         try {
           ctx.ui.setStatus(
             "multi-agent",
-            `⏳ dispatching ${tasks.length} tasks [${strategy}]...`,
+            `🤖 dispatching ${tasks.length} tasks [${strategy}]...`,
           );
         } catch {}
       }
@@ -292,7 +299,7 @@ export default function (pi: ExtensionAPI) {
         try {
           const ok = result.tasks.filter((t) => !t.error).length;
           const fail = result.tasks.filter((t) => t.error).length;
-          ctx.ui.setStatus("multi-agent", `✓ ${ok} done${fail ? `, ${fail} failed` : ""}`);
+          ctx.ui.setStatus("multi-agent", `🤖 ${ok}/${tasks.length} done`);
           ctx.ui.notify(
             `multi-agent: ${ok}/${tasks.length} tasks completed [${strategy}]`,
             fail > 0 ? "warning" : "info",
