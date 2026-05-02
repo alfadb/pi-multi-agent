@@ -6,6 +6,7 @@
   "license": "MIT",
   "pi": {
     "extensions": ["./extensions/pi-multi-agent"],
+    "prompts": ["./prompts"],
     "image": "https://github.com/alfadb/pi-multi-agent/raw/main/docs/pi-multi-agent.png"
   }
 }
