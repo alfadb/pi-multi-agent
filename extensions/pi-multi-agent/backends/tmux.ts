@@ -100,7 +100,7 @@ function cleanOutput(raw: string): string {
     .trim();
 }
 
-// ── Single-turn ─────────────────────────────────────────────────
+// ── Single-turn (pi --print) ──────────────────────────────────
 
 async function executeOneInPane(
   task: Task,
@@ -132,69 +132,6 @@ async function executeOneInPane(
 }
 
 // ── Multi-turn (debate rounds) ─────────────────────────────────
-
-export async function executeTmuxMultiTurn(
-  tasks: Task[],
-  rounds: string[][],
-  opts: TmuxBackendOptions,
-): Promise<TaskResult[][]> {
-  const mainPaneId = getMainPaneId();
-  const panes: (PaneState | null)[] = [];
-  const allResults: TaskResult[][] = tasks.map(() => []);
-
-  try {
-    // Split panes
-    for (let i = 0; i < tasks.length; i++) {
-      panes.push(splitPane(i));
-    }
-    selectPane(mainPaneId);
-
-    const numRounds = rounds[0]?.length ?? 1;
-    for (let r = 0; r < numRounds; r++) {
-      const start = Date.now();
-      const jobs: Promise<{ idx: number; output: string; timedOut: boolean }>[] = [];
-
-      for (let i = 0; i < tasks.length; i++) {
-        const pane = panes[i];
-        if (!pane) continue;
-        const prompt = rounds[i]?.[r] ?? tasks[i].prompt;
-        const doneFile = path.join(os.tmpdir(), `pi-ma-done-${tasks[i].id}-r${r}-${Date.now()}`);
-
-        sendPiCommand(pane.paneId, tasks[i], prompt, opts.extraFlags, doneFile);
-
-        jobs.push((async () => {
-          const { output, timedOut } = await waitForDone(pane.paneId, doneFile, opts.taskTimeoutMs);
-          try { fs.unlinkSync(doneFile); } catch {}
-          return { idx: i, output, timedOut };
-        })());
-      }
-
-      const roundOutputs = await Promise.all(jobs);
-      for (const { idx, output, timedOut } of roundOutputs) {
-        allResults[idx].push({
-          taskId: tasks[idx].id, model: tasks[idx].model, role: tasks[idx].role,
-          output: output || "(no output)",
-          error: timedOut ? `Timed out after ${opts.taskTimeoutMs}ms` : undefined,
-          durationMs: Date.now() - start,
-        });
-      }
-    }
-
-    // Kill all panes
-    for (const pane of panes) {
-      if (pane) killPane(pane.paneId);
-    }
-
-    return allResults;
-  } catch (e: any) {
-    for (const pane of panes) {
-      if (pane) killPane(pane.paneId);
-    }
-    throw e;
-  } finally {
-    selectPane(mainPaneId);
-  }
-}
 
 // ── Public API ──────────────────────────────────────────────────
 

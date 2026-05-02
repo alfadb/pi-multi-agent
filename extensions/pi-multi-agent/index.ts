@@ -23,7 +23,7 @@ import { executeDebate } from "./strategies/debate.js";
 import { executeChain } from "./strategies/chain.js";
 import { executeEnsemble } from "./strategies/ensemble.js";
 import { cleanupRpcSessions } from "./backends/rpc.js";
-import { executeTmux, executeTmuxMultiTurn, isTmuxAvailable } from "./backends/tmux.js";
+import { executeTmux, isTmuxAvailable } from "./backends/tmux.js";
 
 // ── Tool schema ──────────────────────────────────────────────────
 
@@ -121,38 +121,6 @@ async function resolveMode(
   return DEFAULT_CONFIG.strategyModes[strategy];
 }
 
-function buildSynthesis(
-  tasks: Task[],
-  roundResults: TaskResult[][],
-  totalRounds: number,
-): string {
-  const parts: string[] = [
-    `Synthesize this ${totalRounds}-round debate among ${tasks.length} experts.`,
-    "## Participants",
-    ...tasks.map((t) => `- ${t.role ?? t.id} (${t.model})`),
-    "## Debate",
-  ];
-
-  for (let r = 0; r < totalRounds; r++) {
-    parts.push(`### Round ${r + 1}`);
-    for (let i = 0; i < tasks.length; i++) {
-      const result = roundResults[i]?.[r];
-      if (result?.output) {
-        parts.push(`#### ${tasks[i].role ?? tasks[i].id}`, result.output, "");
-      }
-    }
-  }
-
-  parts.push(
-    "---",
-    "## Your Task",
-    "1. Areas of consensus",
-    "2. Areas of disagreement (summarize each position)",
-    "3. Final recommendation with reasoning",
-  );
-
-  return parts.join("\n");
-}
 
 // ── Strategy dispatch ────────────────────────────────────────────
 
@@ -192,168 +160,33 @@ async function dispatch(
     }
 
     case "debate": {
-      const debateRounds = opts.debateRounds ?? 2;
-
       if (effectiveMode === "tmux") {
-        // Build round prompts for multi-turn tmux
-        const allRounds: string[][] = tasks.map(() => []);
-
-        // Round 1: original prompts
-        for (let i = 0; i < tasks.length; i++) {
-          allRounds[i].push(tasks[i].prompt);
-        }
-
-        // Execute Round 1 in tmux
-        const r1Results = await executeTmuxMultiTurn(tasks, allRounds, {
-          taskTimeoutMs: config.timeoutMs,
-          extraFlags: config.extraFlags,
-        });
-
-        // Build subsequent round prompts with cross-references
-        for (let r = 1; r < debateRounds; r++) {
-          for (let i = 0; i < tasks.length; i++) {
-            const othersResponses = tasks
-              .filter((_, j) => j !== i)
-              .map((other, jIdx) => {
-                const otherIdx = tasks.indexOf(other);
-                const resp = r1Results[otherIdx]?.[r - 1]?.output ?? "(no response)";
-                return `## ${other.role ?? other.id}\n\n${resp}`;
-              })
-              .join("\n\n");
-
-            allRounds[i].push([
-              tasks[i].prompt,
-              "",
-              "---",
-              `## Round ${r + 1} — Previous Discussion`,
-              othersResponses,
-              "",
-              "Respond to the points above.",
-            ].join("\n"));
-          }
-
-          const roundResults = await executeTmuxMultiTurn(tasks, allRounds.map((_, i) => [allRounds[i][r]]), {
-            taskTimeoutMs: config.timeoutMs,
-            extraFlags: config.extraFlags,
-          });
-          // Merge into r1Results
-          for (let i = 0; i < tasks.length; i++) {
-            r1Results[i].push(roundResults[i][0]);
-          }
-        }
-
-        // Build synthesis from all rounds
-        const synthesisPrompt = buildSynthesis(tasks, r1Results, debateRounds);
-        const synthesisResolved = resolvedModels.get(tasks[0].id);
-        let synthesis = "";
-        if (synthesisResolved && synthesisResolved.apiKey) {
-          const synthTask: Task = {
-            id: "__synthesis__",
-            model: opts.synthesisModel ?? tasks[0].model,
-            thinking: opts.synthesisThinking ?? "high",
-            prompt: synthesisPrompt,
-          };
-          // Run synthesis as a regular parallel task in tmux
-          const synthResults = await executeTmux([synthTask], resolvedModels, {
-            taskTimeoutMs: config.timeoutMs,
-            extraFlags: config.extraFlags,
-          });
-          synthesis = synthResults[0]?.output ?? "";
-        }
-
-        // Flatten round results to per-task results
-        const taskResults: TaskResult[] = tasks.map((task, i) => ({
-          taskId: task.id, model: task.model, role: task.role,
-          output: r1Results[i].map((r, j) => `## Round ${j + 1}\n\n${r.output}`).join("\n\n---\n\n"),
-          durationMs: r1Results[i].reduce((sum, r) => sum + r.durationMs, 0),
-        }));
-
-        return { strategy, executionMode: effectiveMode, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
+        console.log("[pi-multi-agent] tmux not supported for debate (use pi-side-agents for interactive multi-turn). Falling back to rpc.");
       }
-
-      // Non-tmux: use rpc backend
-      const debateOpts = { ...dispatchOpts, executionMode: "rpc" };
+      const debateMode = effectiveMode === "tmux" ? "rpc" : effectiveMode;
+      const debateOpts = { ...dispatchOpts, executionMode: debateMode };
       const { taskResults: dr, synthesis: ds } = await executeDebate(tasks, resolvedModels, debateOpts);
-      return { strategy, executionMode: "rpc", tasks: dr, synthesis: ds, totalDurationMs: Date.now() - start };
+      return { strategy, executionMode: debateMode, tasks: dr, synthesis: ds, totalDurationMs: Date.now() - start };
     }
 
     case "chain": {
-      let taskResults: TaskResult[];
       if (effectiveMode === "tmux") {
-        // Chain steps visible in separate tmux windows
-        // Build per-step prompts with accumulated context
-        const roundsPerTask = new Map<string, string[]>();
-        let prevOutput = "";
-        for (const task of tasks) {
-          const chainPrompt = prevOutput
-            ? `${task.prompt}\n\n---\n## Previous step output\n${prevOutput}`
-            : task.prompt;
-          roundsPerTask.set(task.id, [chainPrompt]);
-          prevOutput = "(see next round)";
-        }
-        taskResults = await executeTmux(tasks, resolvedModels, {
-          taskTimeoutMs: config.timeoutMs,
-          extraFlags: config.extraFlags,
-        }, roundsPerTask);
-      } else {
-        taskResults = await executeChain(tasks, resolvedModels, dispatchOpts);
+        console.log("[pi-multi-agent] tmux not supported for chain. Falling back to rpc.");
       }
-      return {
-        strategy,
-        executionMode: effectiveMode,
-        tasks: taskResults,
-        totalDurationMs: Date.now() - start,
-      };
+      const chainMode = effectiveMode === "tmux" ? "rpc" : effectiveMode;
+      const chainOpts = { ...dispatchOpts, executionMode: chainMode };
+      const taskResults = await executeChain(tasks, resolvedModels, chainOpts);
+      return { strategy, executionMode: chainMode, tasks: taskResults, totalDurationMs: Date.now() - start };
     }
 
     case "ensemble": {
       if (effectiveMode === "tmux") {
-        // All models answer the same prompt independently, in parallel tmux panes
-        const taskResults = await executeTmux(tasks, resolvedModels, {
-          taskTimeoutMs: config.timeoutMs,
-          extraFlags: config.extraFlags,
-        });
-
-        // Synthesis (in a new tmux pane)
-        const synthesisModel = opts.synthesisModel ?? tasks[0].model;
-        const synthesisResolved = resolvedModels.get(tasks[0].id);
-        let synthesis = "";
-        if (synthesisResolved && synthesisResolved.apiKey) {
-          const responses = taskResults
-            .filter((r) => !r.error)
-            .map((r, i) => `### ${r.role ?? r.taskId} (${r.model})\n\n${r.output}`)
-            .join("\n\n---\n\n");
-
-          const synthTask: Task = {
-            id: "__synthesis__",
-            model: synthesisModel,
-            thinking: opts.synthesisThinking ?? "high",
-            prompt: [
-              "Evaluate these independent responses and synthesize:",
-              "1. Areas of agreement",
-              "2. Disagreements with positions",
-              "3. Best answer with reasoning",
-              "",
-              `## Original: ${tasks[0]?.prompt ?? ""}`,
-              "",
-              "## Responses",
-              responses,
-            ].join("\n"),
-          };
-          const synthResults = await executeTmux([synthTask], resolvedModels, {
-            taskTimeoutMs: config.timeoutMs,
-            extraFlags: config.extraFlags,
-          });
-          synthesis = synthResults[0]?.output ?? "";
-        }
-
-        return { strategy, executionMode: effectiveMode, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
+        console.log("[pi-multi-agent] tmux not supported for ensemble. Falling back to print.");
       }
-
-      // Non-tmux
-      const ensOpts = { ...dispatchOpts, executionMode: "print" };
+      const ensMode = effectiveMode === "tmux" ? "print" : effectiveMode;
+      const ensOpts = { ...dispatchOpts, executionMode: ensMode };
       const { taskResults: er, synthesis: es } = await executeEnsemble(tasks, resolvedModels, ensOpts);
-      return { strategy, executionMode: "print", tasks: er, synthesis: es, totalDurationMs: Date.now() - start };
+      return { strategy, executionMode: ensMode, tasks: er, synthesis: es, totalDurationMs: Date.now() - start };
     }
 
     default:
