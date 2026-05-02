@@ -71,7 +71,7 @@ function sendPiCommand(paneId: string, task: Task, prompt: string, extraFlags: s
   const promptArg = sq(prompt);
   const flags = extraFlags.map(sq).join(" ");
 
-  // Write DONE marker to a file after pi exits (avoids shell echo false positive)
+  // pi output goes to the pane (user sees it). Done marker → file (detection only).
   const cmd = `${piPath} --model ${modelArg} --thinking ${task.thinking} --print --no-session ${flags} ${promptArg} && echo done > ${sq(doneFile)}`;
 
   tmux(["send-keys", "-t", paneId, "-l", cmd]);
@@ -84,29 +84,19 @@ async function waitForDone(paneId: string, doneFile: string, timeoutMs: number):
   while (Date.now() < deadline) {
     if (fs.existsSync(doneFile)) {
       await new Promise((r) => setTimeout(r, 500));
-      const output = extractPiOutput(capturePane(paneId));
+      const output = cleanOutput(capturePane(paneId));
       return { output, timedOut: false };
     }
     await new Promise((r) => setTimeout(r, 1000));
   }
 
-  return { output: extractPiOutput(capturePane(paneId)), timedOut: true };
+  return { output: cleanOutput(capturePane(paneId)), timedOut: true };
 }
 
-function extractPiOutput(raw: string): string {
+function cleanOutput(raw: string): string {
   return raw
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")  // CSI sequences
-    .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "") // OSC sequences
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "") // control chars
-    .split("\n")
-    .filter((line) => {
-      const t = line.trim();
-      // Skip shell prompts and command echoes
-      if (/^[%$#>]\s*$/.test(t)) return false;
-      if (t.includes("--model") && t.includes("--print")) return false;
-      return true;
-    })
-    .join("\n")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "")
     .trim();
 }
 
