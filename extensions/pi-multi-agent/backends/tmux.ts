@@ -1,9 +1,11 @@
 /**
- * Tmux backend — splits current window into panes for real-time visibility.
+ * Tmux backend — splits panes for real-time visibility.
  *
- * Uses `tmux split-window` via execFileSync (proven to work from extensions).
- * Each task gets its own pane running `pi --print`. Panes are killed after
- * output collection.
+ * Two-step pattern:
+ *   1. split-window → creates pane with user's real shell (no inline command)
+ *   2. send-keys → injects commands into the pane's shell
+ *
+ * This preserves the user's shell (zsh/bash/fish), PATH, aliases, env vars.
  */
 
 import { execFileSync } from "node:child_process";
@@ -50,52 +52,55 @@ function capturePane(paneId: string): string {
 async function executeOneInPane(
   task: Task,
   opts: TmuxBackendOptions,
-  mainPaneId: string,
+  index: number,
 ): Promise<TaskResult> {
   const start = Date.now();
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ma-"));
   const exitFile = path.join(tmpDir, "exit.txt");
+  const promptFile = path.join(tmpDir, "prompt.md");
+
+  let paneId: string | undefined;
 
   try {
     // Find pi
     const piPath = findPiPath();
 
-    // Write launch script
-    const prompt = task.prompt;
-    const promptFile = path.join(tmpDir, "prompt.md");
-    fs.writeFileSync(promptFile, prompt, "utf8");
+    // Write prompt to file
+    fs.writeFileSync(promptFile, task.prompt, "utf8");
 
-    const script = `#!/bin/bash
-set -euo pipefail
-echo "=== START:${task.id} ==="
-${piPath} --model ${task.model} --thinking ${task.thinking} --print --no-session ${opts.extraFlags.join(" ")} < '${promptFile}'
-EC=$?
-echo "=== EXIT:$EC ==="
-echo "=== DONE:${task.id} ==="
-echo "done" > '${exitFile}'
-read -n 1 -s -r -p "Press any key..."
-`;
-    const scriptFile = path.join(tmpDir, "run.sh");
-    fs.writeFileSync(scriptFile, script, "utf8");
-    fs.chmodSync(scriptFile, 0o755);
+    // Build the command to run (will be sent via send-keys)
+    const markerPrefix = `PI_MA_${task.id}_`;
+    const piCmd = [
+      `echo "${markerPrefix}START"`,
+      `${piPath} --model ${task.model} --thinking ${task.thinking} --print --no-session ${opts.extraFlags.join(" ")} < '${promptFile}'`,
+      `echo "${markerPrefix}EXIT:$?"`,
+      `echo "${markerPrefix}DONE"`,
+      `echo "done" > '${exitFile}'`,
+    ].join(" && ");
 
-    // Split pane: first horizontal, rest vertical
-    const isFirst = true; // We don't track this easily — just use same layout
-    const newPaneId = tmux([
-      "split-window", "-P", "-F", "#{pane_id}",
-      "-h", "-l", "80",
-      `bash '${scriptFile}'`,
-    ]);
+    // ── Step 1: Split pane (user's shell, no command) ──
+    const splitArgs = index === 0
+      ? ["split-window", "-P", "-F", "#{pane_id}", "-h", "-l", "80"]
+      : ["split-window", "-P", "-F", "#{pane_id}", "-v", "-l", "15"];
 
-    // Wait for exit file
+    paneId = tmux(splitArgs);
+
+    // ── Step 2: Send-keys to inject command ──
+    // Send the command character by character to the pane's shell
+    tmux(["send-keys", "-t", paneId, "-l", piCmd]);
+    tmux(["send-keys", "-t", paneId, "Enter"]);
+
+    // ── Poll for exit file ──
     const deadline = Date.now() + opts.taskTimeoutMs;
     let output = "";
     let error: string | undefined;
 
     while (Date.now() < deadline) {
       if (fs.existsSync(exitFile)) {
-        output = capturePane(newPaneId);
-        killPane(newPaneId);
+        // Wait a beat for all output to flush
+        await new Promise((r) => setTimeout(r, 500));
+        output = capturePane(paneId!);
+        killPane(paneId!);
         break;
       }
       await new Promise((r) => setTimeout(r, 2000));
@@ -103,18 +108,25 @@ read -n 1 -s -r -p "Press any key..."
 
     if (!output && !error) {
       error = `Timed out after ${opts.taskTimeoutMs}ms`;
-      output = capturePane(newPaneId);
-      killPane(newPaneId);
+      output = capturePane(paneId!);
+      killPane(paneId!);
     }
 
-    // Clean up output: extract between START and DONE
-    const startMarker = `=== START:${task.id} ===`;
-    const doneMarker = `=== DONE:${task.id} ===`;
-    const startIdx = output.indexOf(startMarker);
-    const doneIdx = output.indexOf(doneMarker);
-    if (startIdx !== -1 && doneIdx !== -1) {
-      output = output.slice(startIdx + startMarker.length, doneIdx).trim();
+    // Extract output between START and DONE markers
+    const startMarker = `${markerPrefix}START`;
+    const doneMarker = `${markerPrefix}DONE`;
+    const si = output.indexOf(startMarker);
+    const di = output.indexOf(doneMarker);
+    if (si !== -1 && di !== -1) {
+      output = output.slice(si + startMarker.length, di).trim();
     }
+
+    // Strip ANSI escape codes from captured output
+    output = output
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+      .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "")
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
+      .trim();
 
     return {
       taskId: task.id,
@@ -125,6 +137,7 @@ read -n 1 -s -r -p "Press any key..."
       durationMs: Date.now() - start,
     };
   } catch (e: any) {
+    if (paneId) killPane(paneId);
     return {
       taskId: task.id,
       model: task.model,
@@ -157,11 +170,9 @@ export async function executeTmux(
 ): Promise<TaskResult[]> {
   const mainPaneId = getMainPaneId();
 
-  // Run all tasks in parallel
-  const jobs = tasks.map((task) => executeOneInPane(task, opts, mainPaneId));
+  const jobs = tasks.map((task, i) => executeOneInPane(task, opts, i));
   const results = await Promise.all(jobs);
 
-  // Select back to main pane
   try { tmux(["select-pane", "-t", mainPaneId]); } catch {}
 
   return results;
