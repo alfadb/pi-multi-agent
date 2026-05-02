@@ -421,18 +421,32 @@ export default function (pi: ExtensionAPI) {
       "Returns the text analysis from the vision model.",
     ],
     parameters: Type.Object({
-      imageBase64: Type.String({ description: "Base64 encoded image data" }),
+      imageBase64: Type.Optional(Type.String({ description: "Base64 encoded image data" })),
+      path: Type.Optional(Type.String({ description: "Path to image file (alternative to imageBase64)" })),
       mimeType: Type.Optional(Type.String({ description: "Image MIME type, e.g. image/png" })),
       prompt: Type.String({ description: "What to analyze/look for in the image" }),
     }),
 
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        // Check if current model already supports images — if so, suggest the LLM do it directly
-        if (ctx.model?.input?.includes("image")) {
-          return {
-            content: [{ type: "text", text: "Current model supports images directly. No delegation needed. Describe the image in your prompt." }],
-          };
+        // Resolve image data: path > base64
+        let imageBase64 = params.imageBase64;
+        let mimeType = params.mimeType || "image/png";
+        if (params.path && !imageBase64) {
+          try {
+            const buf = fs.readFileSync(params.path);
+            imageBase64 = buf.toString("base64");
+            const ext = params.path.split('.').pop()?.toLowerCase();
+            if (ext === "jpg" || ext === "jpeg") mimeType = "image/jpeg";
+            else if (ext === "png") mimeType = "image/png";
+            else if (ext === "webp") mimeType = "image/webp";
+            else if (ext === "gif") mimeType = "image/gif";
+          } catch (e: any) {
+            return { content: [{ type: "text", text: `Failed to read image: ${e.message}` }], isError: true };
+          }
+        }
+        if (!imageBase64) {
+          return { content: [{ type: "text", text: "No image provided. Pass imageBase64 or path." }], isError: true };
         }
 
         // Find best vision model
@@ -472,7 +486,7 @@ export default function (pi: ExtensionAPI) {
               role: "user",
               content: [
                 { type: "text", text: params.prompt },
-                { type: "image", data: params.imageBase64, mimeType: params.mimeType || "image/png" },
+                { type: "image", data: imageBase64, mimeType },
               ],
               timestamp: Date.now(),
             }],
