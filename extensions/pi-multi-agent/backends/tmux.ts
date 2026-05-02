@@ -293,6 +293,7 @@ export async function executeTmux(
   opts: TmuxBackendOptions,
   roundsPerTask?: Map<string, string[]>,
 ): Promise<TaskResult[]> {
+  console.error(`[pi-multi-agent] executeTmux called with ${tasks.length} tasks, models: ${[...resolvedModels.keys()].join(", ")}`);
   const jobs = tasks.map((task) => {
     const rounds = roundsPerTask?.get(task.id);
     return executeOneInTmux(task, opts, rounds ? "rpc" : "print", rounds);
@@ -302,9 +303,23 @@ export async function executeTmux(
 
 export async function isTmuxAvailable(): Promise<boolean> {
   try {
-    const result = tmux(["display-message", "-p", "#S"]);
-    return result.ok && result.stdout.trim().length > 0;
-  } catch {
+    // Minimal test: create and kill a window
+    const session = tmuxOrThrow(["display-message", "-p", "#S"]).trim();
+    const testName = `pi-ma-test-${Date.now()}`;
+    const out = tmuxOrThrow([
+      "new-window", "-d", "-t", `${session}:`,
+      "-P", "-F", "#{window_id}",
+      "-n", testName,
+      "echo", "hello from tmux; sleep 3",
+    ]);
+    const windowId = out.trim();
+    console.error(`[pi-multi-agent] Test window created: ${windowId}`);
+    await new Promise((r) => setTimeout(r, 1000));
+    tmux(["kill-window", "-t", windowId]);
+    console.error(`[pi-multi-agent] Test window killed: ${windowId}`);
+    return true;
+  } catch (e: any) {
+    console.error(`[pi-multi-agent] Tmux test failed: ${e.message}`);
     return false;
   }
 }
