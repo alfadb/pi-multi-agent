@@ -326,13 +326,12 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Generate image: imagine(prompt, size?, quality?)",
     promptGuidelines: [
       "Use imagine when the user asks for image generation, illustration, or visual creation.",
-      "Default model is dall-e-3. Optionally override with model parameter.",
-      "Default quality is hd, default size is 1024x1024.",
+      "Generate images using OpenAI's latest model (gpt-image-2). Default quality is hd, default size is 1024x1024.",
       "The tool returns a base64 image the LLM can display directly.",
     ],
     parameters: Type.Object({
       prompt: Type.String({ description: "Image description/prompt" }),
-      model: Type.Optional(Type.String({ description: "Image model: dall-e-3 (default, best), dall-e-2" })),
+      model: Type.Optional(Type.String({ description: "Image model: gpt-image-2 (default, latest), dall-e-3, dall-e-2" })),
       size: Type.Optional(Type.String({ description: "1024x1024, 1792x1024, or 1024x1792" })),
       quality: Type.Optional(Type.String({ description: "standard or hd (default)" })),
       style: Type.Optional(Type.String({ description: "vivid or natural (default)" })),
@@ -358,7 +357,7 @@ export default function (pi: ExtensionAPI) {
             "Authorization": `Bearer ${auth.apiKey}`,
           },
           body: JSON.stringify({
-            model: params.model || "dall-e-3",
+            model: params.model || "gpt-image-2",
             prompt: params.prompt,
             n: 1,
             size: params.size || "1024x1024",
