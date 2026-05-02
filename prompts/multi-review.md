@@ -15,14 +15,13 @@
 |---|---|---|---|
 | testing | 覆盖测试缺口需要结构化推理 | deepseek/deepseek-v4-pro | openai/gpt-5.5 |
 | security | 安全审查需要最强的推理能力（opus级别 > sonnet > 其他） | anthropic/claude-opus-4-7 | deepseek-v4-pro |
-| red-team | 对抗审查需要最强的推理 | openai/gpt-5.5-pro | anthropic/claude-opus-4-7 |
 | maintainability | 可维护性审查，中等推理即可 | anthropic/claude-opus-4-7 | openai/gpt-5.5 |
 | performance | 性能审查需要结构化推理 | deepseek/deepseek-v4-pro | openai/gpt-5.5 |
 | api-contract | API 契约审查，中等推理 | openai/gpt-5.5 | deepseek-v4-pro |
 | data-migration | 数据迁移审查，中等推理 | deepseek/deepseek-v4-pro | openai/gpt-5.5 |
 
 thinking 等级:
-- security/red-team → `xhigh`
+- security → `xhigh`
 - testing/performance → `xhigh`
 - maintainability/api-contract/data-migration → `high`
 
@@ -52,7 +51,6 @@ multi_dispatch(
 —— diff ——
 {DIFF}"},
 
-    {id:"red-team", model:"<按原则选择>", thinking:"<按原则选择>",
      prompt:"以对抗视角审查这个 diff。假设代码作者犯了错误，找出所有可能被利用的漏洞、不变量违反、边界条件遗漏。每项发现标注严重度、置信度、文件:行号。
 
 —— diff ——
