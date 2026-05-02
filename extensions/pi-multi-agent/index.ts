@@ -477,31 +477,41 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `Auth failed for vision model: ${auth.error || "no key"}` }], isError: true };
         }
 
-        // Call vision model via pi --print (ensures image data is properly passed)
+        // Call vision model via pi --print
+        const args = [
+          "--model", `${bestVision.provider}/${bestVision.id}`,
+          "--thinking", "off",
+          "--print",
+          "--no-session",
+        ];
+
+        // Pass image via @path syntax (must be absolute)
+        const resolvedPath = params.path ? path.resolve(params.path) : "";
+        if (resolvedPath) {
+          args.push(`@${resolvedPath}`);
+        }
+
+        // Prompt
+        const promptArg = params.prompt || "Describe this image";
+        args.push(promptArg);
+
         const { spawn } = await import("node:child_process");
-        const tmpPrompt = path.join(os.tmpdir(), `pi-ma-vision-${Date.now()}.md`);
-        fs.writeFileSync(tmpPrompt, params.prompt, "utf8");
 
         const result = await new Promise<string>((resolve, reject) => {
-          const child = spawn("pi", [
-            "--model", `${bestVision.provider}/${bestVision.id}`,
-            "--thinking", "off",
-            "--print",
-            "--no-session",
-            `@${params.path || tmpPrompt}`,
-            params.prompt,
-          ], {
+          const child = spawn("pi", args, {
             env: { ...process.env, [`${bestVision.provider.toUpperCase()}_API_KEY`]: auth.apiKey },
             stdio: ["pipe", "pipe", "pipe"],
             timeout: 120_000,
           });
 
           let stdout = "";
+          let stderr = "";
           child.stdout?.on("data", (c: Buffer) => { stdout += c.toString(); });
+          child.stderr?.on("data", (c: Buffer) => { stderr += c.toString(); });
           child.on("error", reject);
           child.on("close", (code) => {
             if (code === 0) resolve(stdout.trim());
-            else reject(new Error(`pi exited with code ${code}`));
+            else reject(new Error(`pi exited with code ${code}: ${stderr.slice(-300)}`));
           });
         });
 
