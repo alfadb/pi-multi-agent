@@ -10,6 +10,9 @@
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type {
   Task,
   Strategy,
@@ -374,16 +377,28 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (!imageBase64) {
-          return { content: [{ type: "text", text: "No image in response. Model may not support image generation." }], isError: true };
+          return { content: [{ type: "text", text: "No image in response." }], isError: true };
         }
 
-        return {
-          content: [
-            { type: "text", text: `✅ Generated (${params.model || "gpt-image-2"}, ${params.size || "1024x1024"}, ${params.quality || "hd"})` },
-            { type: "image", data: imageBase64, mimeType: "image/png" },
-          ],
-          details: { model: params.model || "gpt-image-2", size: params.size, quality: params.quality },
+        // Save to file (current model may not support image display)
+        const outDir = path.join(ctx.cwd || os.homedir(), ".pi-multi-agent-output");
+        try { fs.mkdirSync(outDir, { recursive: true }); } catch {}
+        const filename = `image-${Date.now()}.png`;
+        const filepath = path.join(outDir, filename);
+        try { fs.writeFileSync(filepath, Buffer.from(imageBase64, "base64")); } catch {}
+
+        // Return both the image (if model supports it) and the file path
+        const result: any = {
+          content: [{ type: "text", text: `✅ Image saved: ${filepath}` }],
+          details: { model: params.model || "gpt-image-2", size: params.size, quality: params.quality, path: filepath },
         };
+
+        // If current model supports images, also return the base64
+        if (ctx.model?.input?.includes("image")) {
+          result.content.push({ type: "image", data: imageBase64, mimeType: "image/png" });
+        }
+
+        return result;
       } catch (e: any) {
         return { content: [{ type: "text", text: `Image generation error: ${e?.message || String(e)}` }], isError: true };
       }
