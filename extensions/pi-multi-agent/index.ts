@@ -121,33 +121,6 @@ async function resolveMode(
   return DEFAULT_CONFIG.strategyModes[strategy];
 }
 
-/** Build per-task round prompts from debate results for tmux replay. */
-function buildDebateRounds(
-  tasks: Task[],
-  debateResults: TaskResult[],
-  totalRounds: number,
-): Map<string, string[]> {
-  const map = new Map<string, string[]>();
-
-  for (const task of tasks) {
-    const result = debateResults.find((r) => r.taskId === task.id);
-    const output = result?.output ?? "";
-
-    // Split the joined output back into rounds (separated by "---")
-    const parts = output.split(/\n---\n/);
-    const rounds: string[] = [];
-
-    for (let r = 0; r < totalRounds; r++) {
-      const part = parts[r] ?? "";
-      const clean = part.replace(/^## Round \d+\s*\n+/m, "").trim();
-      rounds.push(clean || `(Round ${r + 1} output not available)`);
-    }
-
-    map.set(task.id, rounds);
-  }
-
-  return map;
-}
 
 // ── Strategy dispatch ────────────────────────────────────────────
 
@@ -187,6 +160,9 @@ async function dispatch(
     }
 
     case "debate": {
+      if (effectiveMode === "tmux") {
+        console.log("[pi-multi-agent] tmux not supported for debate, falling back to rpc");
+      }
       const debateMode = effectiveMode === "tmux" ? "rpc" : effectiveMode;
       const debateOpts = { ...dispatchOpts, executionMode: debateMode };
       const { taskResults: dr, synthesis: ds } = await executeDebate(
@@ -194,18 +170,6 @@ async function dispatch(
         resolvedModels,
         debateOpts,
       );
-
-      // For tmux mode: also show the debate rounds visually
-      if (effectiveMode === "tmux") {
-        // Run the same debate rounds in tmux panes for visibility
-        // Build per-task round prompts from debate results
-        const roundsPerTask = buildDebateRounds(tasks, dr, opts.debateRounds ?? 2);
-        await executeTmux(tasks, resolvedModels, {
-          taskTimeoutMs: config.timeoutMs,
-          extraFlags: config.extraFlags,
-        }, roundsPerTask);
-      }
-
       return {
         strategy,
         executionMode: debateMode,
@@ -216,22 +180,29 @@ async function dispatch(
     }
 
     case "chain": {
-      const chainMode = effectiveMode === "tmux" ? "rpc" : effectiveMode;
-      const chainOpts = { ...dispatchOpts, executionMode: chainMode };
-      let taskResults = await executeChain(tasks, resolvedModels, chainOpts);
-
-      // For tmux mode: also show the chain visually
-      // Chain is sequential by nature, but we can show each step in its own pane
+      let taskResults: TaskResult[];
       if (effectiveMode === "tmux") {
+        // Chain steps visible in separate tmux windows
+        // Build per-step prompts with accumulated context
+        const roundsPerTask = new Map<string, string[]>();
+        let prevOutput = "";
+        for (const task of tasks) {
+          const chainPrompt = prevOutput
+            ? `${task.prompt}\n\n---\n## Previous step output\n${prevOutput}`
+            : task.prompt;
+          roundsPerTask.set(task.id, [chainPrompt]);
+          prevOutput = "(see next round)";
+        }
         taskResults = await executeTmux(tasks, resolvedModels, {
           taskTimeoutMs: config.timeoutMs,
           extraFlags: config.extraFlags,
-        });
+        }, roundsPerTask);
+      } else {
+        taskResults = await executeChain(tasks, resolvedModels, dispatchOpts);
       }
-
       return {
         strategy,
-        executionMode: taskResults.length > 0 ? chainMode : effectiveMode,
+        executionMode: effectiveMode,
         tasks: taskResults,
         totalDurationMs: Date.now() - start,
       };
@@ -239,7 +210,7 @@ async function dispatch(
 
     case "ensemble": {
       if (effectiveMode === "tmux") {
-        console.log("[pi-multi-agent] tmux not supported for ensemble, using print");
+        console.log("[pi-multi-agent] tmux not supported for ensemble, falling back to print");
       }
       const ensMode = effectiveMode === "tmux" ? "print" : effectiveMode;
       const ensOpts = { ...dispatchOpts, executionMode: ensMode };
