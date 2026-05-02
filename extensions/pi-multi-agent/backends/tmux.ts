@@ -1,13 +1,9 @@
 /**
- * Tmux backend — spawns tasks in separate tmux windows (pi-side-agents pattern).
+ * Tmux backend — splits current window into panes for real-time visibility.
  *
- * Uses `tmux new-window -d` to create background windows. Each task runs
- * `pi --print` in its own named window. Output is piped to a log file and
- * collected via `tmux capture-pane`. Windows are killed after collection.
- *
- * Sub-modes:
- *   tmux+print — pi --print for single-turn tasks
- *   tmux+rpc   — pi --mode rpc for multi-turn tasks (via pre-baked JSONL)
+ * Uses `tmux split-window` via execFileSync (proven to work from extensions).
+ * Each task gets its own pane running `pi --print`. Panes are killed after
+ * output collection.
  */
 
 import { execFileSync } from "node:child_process";
@@ -21,235 +17,103 @@ export interface TmuxBackendOptions {
   extraFlags: string[];
 }
 
-// ── Tmux primitives (sync — pi-side-agents uses spawnSync) ──────
+// ── Sync tmux helpers ───────────────────────────────────────────
 
-function tmux(args: string[], input?: string): { ok: boolean; stdout: string; stderr: string } {
-  try {
-    const result = execFileSync("tmux", args, {
-      input,
-      encoding: "utf8",
-      timeout: 30_000,
-    });
-    return { ok: true, stdout: result, stderr: "" };
-  } catch (e: any) {
-    return {
-      ok: false,
-      stdout: e?.stdout ?? "",
-      stderr: e?.stderr ?? e?.message ?? String(e),
-    };
-  }
-}
-
-function tmuxOrThrow(args: string[], input?: string): string {
-  const result = tmux(args, input);
-  if (!result.ok) {
-    throw new Error(`tmux ${args[0]} failed: ${result.stderr || result.stdout}`);
-  }
-  return result.stdout;
-}
-
-function getCurrentSession(): string {
-  return tmuxOrThrow(["display-message", "-p", "#S"]).trim();
-}
-
-function createWindow(session: string, name: string): { windowId: string; windowIndex: number } {
-  const out = tmuxOrThrow([
-    "new-window", "-d", "-t", `${session}:`,
-    "-P", "-F", "#{window_id} #{window_index}",
-    "-n", name,
-  ]).trim();
-  const [windowId, indexRaw] = out.split(/\s+/);
-  return { windowId, windowIndex: Number(indexRaw) };
-}
-
-function pipePaneToFile(windowId: string, logPath: string): void {
-  tmuxOrThrow(["pipe-pane", "-t", windowId, "-o", `cat >> ${logPath}`]);
-}
-
-function capturePane(windowId: string): string {
-  const result = tmux(["capture-pane", "-p", "-t", windowId, "-S", "-", "-E", "-"]);
-  return result.ok ? result.stdout : "";
-}
-
-function sendKeys(windowId: string, keys: string): void {
-  tmuxOrThrow(["send-keys", "-t", windowId, keys, "C-m"]);
-}
-
-function killWindow(windowId: string): void {
-  tmux(["kill-window", "-t", windowId]);
-}
-
-function windowExists(windowId: string): boolean {
-  const result = tmux(["display-message", "-p", "-t", windowId, "#{window_id}"]);
-  return result.ok && result.stdout.trim() === windowId;
-}
-
-// ── Shell escaping ──────────────────────────────────────────────
-
-function shellQuote(s: string): string {
-  return `'${s.replace(/'/g, `'"'"'`)}'`;
-}
-
-// ── Task execution ──────────────────────────────────────────────
-
-interface RpcRound {
-  prompt: string;
-}
-
-function buildRpcCommandFile(taskId: string, rounds: RpcRound[], tmpDir: string): string {
-  const file = path.join(tmpDir, `${taskId}-rpc-commands.jsonl`);
-  const lines = rounds.map((r, i) => {
-    if (i === 0) return JSON.stringify({ type: "prompt", message: r.prompt });
-    return JSON.stringify({ type: "prompt", message: r.prompt, streamingBehavior: "followUp" });
+function tmux(args: string[], input?: string): string {
+  const result = execFileSync("tmux", args, {
+    input,
+    encoding: "utf8",
+    timeout: 30_000,
+    stdio: ["pipe", "pipe", "pipe"],
   });
-  fs.writeFileSync(file, lines.join("\n") + "\n", "utf8");
-  return file;
+  return result.trim();
 }
 
-function findPiPath(): string {
-  const paths = (process.env.PATH || "").split(":");
-  for (const p of paths) {
-    const candidate = path.join(p, "pi");
-    try { if (fs.existsSync(candidate)) return candidate; } catch {}
-  }
-  return "pi";
+function getMainPaneId(): string {
+  return tmux(["display-message", "-p", "#{pane_id}"]);
 }
 
-function buildLaunchScript(
-  task: Task,
-  piPath: string,
-  promptFile: string,
-  exitFile: string,
-  subMode: "print" | "rpc",
-  extraFlags: string[],
-): string {
-  const modelArg = shellQuote(`--model=${task.model}`);
-
-  const args = [
-    piPath,
-    modelArg,
-    `--thinking=${task.thinking}`,
-    "--no-session",
-    ...extraFlags,
-  ];
-
-  if (task.tools) args.push(`--tools=${shellQuote(task.tools)}`);
-
-  if (subMode === "print") {
-    args.push("--print");
-  } else {
-    args.push("--mode=rpc");
-  }
-
-  const piCmd = args.join(" ");
-
-  return `#!/usr/bin/env bash
-set -euo pipefail
-${piCmd} < ${shellQuote(promptFile)}
-EXIT=$?
-echo '{"exitCode":'$EXIT',"finishedAt":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > ${shellQuote(exitFile)}
-if [ $EXIT -eq 0 ]; then echo "[pi-ma] DONE:${task.id}"; else echo "[pi-ma] ERROR:${task.id} code=$EXIT"; fi
-read -n 1 -s -r -p "[pi-ma] Press any key..." || true
-echo
-tmux kill-window -t "${shellQuote(task.id)}" 2>/dev/null || true
-`;
+function killPane(paneId: string): void {
+  try { tmux(["kill-pane", "-t", paneId]); } catch {}
 }
 
-function parseExitFile(exitFile: string): { exitCode?: number; finishedAt?: string } | null {
+function capturePane(paneId: string): string {
   try {
-    const raw = fs.readFileSync(exitFile, "utf8").trim();
-    if (!raw) return null;
-    return JSON.parse(raw);
+    return tmux(["capture-pane", "-p", "-t", paneId, "-S", "-", "-E", "-"]);
   } catch {
-    return null;
+    return "";
   }
 }
 
-/**
- * Execute a single task in a tmux window.
- */
-async function executeOneInTmux(
+// ── Execute a task in a tmux pane ──────────────────────────────
+
+async function executeOneInPane(
   task: Task,
   opts: TmuxBackendOptions,
-  subMode: "print" | "rpc",
-  rounds?: string[],
+  mainPaneId: string,
 ): Promise<TaskResult> {
   const start = Date.now();
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ma-tmux-"));
-  const promptFile = path.join(tmpDir, "prompt.md");
-  const exitFile = path.join(tmpDir, "exit.json");
-  const logPath = path.join(tmpDir, "output.log");
-  const launchScriptPath = path.join(tmpDir, "launch.sh");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-ma-"));
+  const exitFile = path.join(tmpDir, "exit.txt");
 
   try {
-    // Build prompt
-    const prompt = rounds
-      ? rounds.map((r, i) => `## Round ${i + 1}\n\n${r}`).join("\n\n---\n\n")
-      : task.prompt;
+    // Find pi
+    const piPath = findPiPath();
+
+    // Write launch script
+    const prompt = task.prompt;
+    const promptFile = path.join(tmpDir, "prompt.md");
     fs.writeFileSync(promptFile, prompt, "utf8");
 
-    // If multi-turn RPC, pre-bake commands
-    let actualPromptFile = promptFile;
-    let actualSubMode = subMode;
-    if (subMode === "rpc" && rounds && rounds.length > 1) {
-      actualPromptFile = buildRpcCommandFile(task.id, rounds.map((p) => ({ prompt: p })), tmpDir);
-      actualSubMode = "rpc";
-    }
+    const script = `#!/bin/bash
+set -euo pipefail
+echo "=== START:${task.id} ==="
+${piPath} --model ${task.model} --thinking ${task.thinking} --print --no-session ${opts.extraFlags.join(" ")} < '${promptFile}'
+EC=$?
+echo "=== EXIT:$EC ==="
+echo "=== DONE:${task.id} ==="
+echo "done" > '${exitFile}'
+read -n 1 -s -r -p "Press any key..."
+`;
+    const scriptFile = path.join(tmpDir, "run.sh");
+    fs.writeFileSync(scriptFile, script, "utf8");
+    fs.chmodSync(scriptFile, 0o755);
 
-    // Build launch script
-    const piPath = findPiPath();
-    const launchScript = buildLaunchScript(
-      task, piPath, actualPromptFile, exitFile, actualSubMode, opts.extraFlags,
-    );
-    fs.writeFileSync(launchScriptPath, launchScript, "utf8");
-    fs.chmodSync(launchScriptPath, 0o755);
+    // Split pane: first horizontal, rest vertical
+    const isFirst = true; // We don't track this easily — just use same layout
+    const newPaneId = tmux([
+      "split-window", "-P", "-F", "#{pane_id}",
+      "-h", "-l", "80",
+      `bash '${scriptFile}'`,
+    ]);
 
-    // Create tmux window in background
-    const session = getCurrentSession();
-    const windowName = task.role ?? task.id;
-    const { windowId } = createWindow(session, windowName);
-
-    // Pipe output to log file
-    pipePaneToFile(windowId, logPath);
-
-    // Send the launch command
-    sendKeys(windowId, `bash ${shellQuote(launchScriptPath)}`);
-
-    // Poll for completion
+    // Wait for exit file
     const deadline = Date.now() + opts.taskTimeoutMs;
     let output = "";
     let error: string | undefined;
 
     while (Date.now() < deadline) {
-      // Check exit file
-      const exit = parseExitFile(exitFile);
-      if (exit) {
-        // Task finished — capture all output
-        output = stripNoise(capturePane(windowId));
-        if (exit.exitCode !== 0) {
-          error = `Task exited with code ${exit.exitCode}`;
-        }
-        killWindow(windowId);
+      if (fs.existsSync(exitFile)) {
+        output = capturePane(newPaneId);
+        killPane(newPaneId);
         break;
       }
-
-      // Check if window still exists
-      if (!windowExists(windowId)) {
-        // Window died unexpectedly — try to get log output
-        try { output = fs.readFileSync(logPath, "utf8"); } catch {}
-        output = stripNoise(output);
-        error = "Tmux window died unexpectedly";
-        break;
-      }
-
       await new Promise((r) => setTimeout(r, 2000));
     }
 
     if (!output && !error) {
       error = `Timed out after ${opts.taskTimeoutMs}ms`;
-      try { output = fs.readFileSync(logPath, "utf8"); } catch {}
-      output = stripNoise(output);
-      killWindow(windowId);
+      output = capturePane(newPaneId);
+      killPane(newPaneId);
+    }
+
+    // Clean up output: extract between START and DONE
+    const startMarker = `=== START:${task.id} ===`;
+    const doneMarker = `=== DONE:${task.id} ===`;
+    const startIdx = output.indexOf(startMarker);
+    const doneIdx = output.indexOf(doneMarker);
+    if (startIdx !== -1 && doneIdx !== -1) {
+      output = output.slice(startIdx + startMarker.length, doneIdx).trim();
     }
 
     return {
@@ -274,52 +138,40 @@ async function executeOneInTmux(
   }
 }
 
-function stripNoise(text: string): string {
-  // Strip ANSI escape sequences and common TUI noise
-  return text
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, "")
-    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "")
-    .replace(/\[pi-ma\] (DONE|ERROR):[^\n]*\n?/g, "")
-    .replace(/Press any key\.\.\./g, "")
-    .trim();
+function findPiPath(): string {
+  const paths = (process.env.PATH || "").split(":");
+  for (const p of paths) {
+    const candidate = path.join(p, "pi");
+    try { if (fs.existsSync(candidate)) return candidate; } catch {}
+  }
+  return "pi";
 }
 
 // ── Public API ──────────────────────────────────────────────────
 
 export async function executeTmux(
   tasks: Task[],
-  resolvedModels: Map<string, ResolvedModel>,
+  _resolvedModels: Map<string, ResolvedModel>,
   opts: TmuxBackendOptions,
-  roundsPerTask?: Map<string, string[]>,
+  _roundsPerTask?: Map<string, string[]>,
 ): Promise<TaskResult[]> {
-  console.error(`[pi-multi-agent] executeTmux called with ${tasks.length} tasks, models: ${[...resolvedModels.keys()].join(", ")}`);
-  const jobs = tasks.map((task) => {
-    const rounds = roundsPerTask?.get(task.id);
-    return executeOneInTmux(task, opts, rounds ? "rpc" : "print", rounds);
-  });
-  return Promise.all(jobs);
+  const mainPaneId = getMainPaneId();
+
+  // Run all tasks in parallel
+  const jobs = tasks.map((task) => executeOneInPane(task, opts, mainPaneId));
+  const results = await Promise.all(jobs);
+
+  // Select back to main pane
+  try { tmux(["select-pane", "-t", mainPaneId]); } catch {}
+
+  return results;
 }
 
 export async function isTmuxAvailable(): Promise<boolean> {
   try {
-    // Minimal test: create and kill a window
-    const session = tmuxOrThrow(["display-message", "-p", "#S"]).trim();
-    const testName = `pi-ma-test-${Date.now()}`;
-    const out = tmuxOrThrow([
-      "new-window", "-d", "-t", `${session}:`,
-      "-P", "-F", "#{window_id}",
-      "-n", testName,
-      "echo", "hello from tmux; sleep 3",
-    ]);
-    const windowId = out.trim();
-    console.error(`[pi-multi-agent] Test window created: ${windowId}`);
-    await new Promise((r) => setTimeout(r, 1000));
-    tmux(["kill-window", "-t", windowId]);
-    console.error(`[pi-multi-agent] Test window killed: ${windowId}`);
+    tmux(["display-message", "-p", "#S"]);
     return true;
-  } catch (e: any) {
-    console.error(`[pi-multi-agent] Tmux test failed: ${e.message}`);
+  } catch {
     return false;
   }
 }
