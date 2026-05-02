@@ -4,7 +4,7 @@
 
 ## 模型选择
 
-先执行 `pi --list-models` 确认可用模型。选择 2-3 个不同类型的最强可用模型（如 deepseek + openai + anthropic 各一个），以最大化视角多样性。thinking 统一 `xhigh`。
+先执行 `pi --list-models` 确认可用模型。**每个角色选择不同 provider 系列的最强模型**（anthropic: opus > sonnet, openai: pro > 普通, deepseek: pro > flash）。如不足 3 个 provider，从同一 provider 选不同模型。thinking 统一 `xhigh`。
 
 ## 执行
 

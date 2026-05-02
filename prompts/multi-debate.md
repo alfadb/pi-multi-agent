@@ -4,7 +4,13 @@
 
 ## 模型选择
 
-先执行 `pi --list-models` 确认可用模型。优选推理性最强的模型（opus 级别 > pro > 其他），每个角色尽量用不同模型以增加视角多样性。无首选时自动降级。thinking 统一 `xhigh`。
+先执行 `pi --list-models` 确认可用模型。**每个角色选择不同 provider 系列的最强模型**，以最大化视角多样性：
+
+- anthropic 系列 → 选最强的（opus > sonnet > haiku）
+- openai 系列 → 选最强的（pro > 普通 > mini）
+- deepseek 系列 → 选最强的（pro > flash）
+
+如不足 3 个 provider 可用，从同一 provider 选不同模型。thinking 统一 `xhigh`。
 
 ## 执行
 
