@@ -164,7 +164,7 @@ async function dispatch(
   const start = Date.now();
 
   // Resolve actual execution mode: explicit override > tmux if available > default
-  const effectiveMode = resolveMode(opts.executionMode, strategy);
+  const effectiveMode = await resolveMode(opts.executionMode, strategy);
   const dispatchOpts = { ...config, executionMode: effectiveMode };
 
   switch (strategy) {
