@@ -114,13 +114,13 @@ async function executeOneInPane(
       killPane(paneId!);
     }
 
-    // Extract output between START and DONE markers
+    // Extract output between START and EXIT markers (pi's actual output)
     const startMarker = `${markerPrefix}START`;
-    const doneMarker = `${markerPrefix}DONE`;
+    const exitMarker = `${markerPrefix}EXIT`;
     const si = output.indexOf(startMarker);
-    const di = output.indexOf(doneMarker);
-    if (si !== -1 && di !== -1) {
-      output = output.slice(si + startMarker.length, di).trim();
+    const ei = output.indexOf(exitMarker);
+    if (si !== -1 && ei !== -1 && ei > si) {
+      output = output.slice(si + startMarker.length, ei).trim();
     }
 
     // Strip ANSI escape codes from captured output
