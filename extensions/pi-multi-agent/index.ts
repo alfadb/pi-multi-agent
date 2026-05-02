@@ -102,9 +102,6 @@ async function resolveModels(
   return resolved;
 }
 
-// ── Mode resolution ─────────────────────────────────────────────
-
-
 // ── Strategy dispatch ────────────────────────────────────────────
 
 async function dispatch(
@@ -119,44 +116,42 @@ async function dispatch(
 
   const start = Date.now();
 
-  // Use explicit mode override, or strategy default
-  const effectiveMode = opts.executionMode ?? DEFAULT_CONFIG.strategyModes[strategy];
+  // Validate tasks
+  if (tasks.length === 0) {
+    return { strategy, executionMode: "print", tasks: [], error: "No tasks provided", totalDurationMs: 0 };
+  }
+
+  // Validate and resolve execution mode
+  const VALID_MODES = ["print", "rpc"];
+  let effectiveMode = opts.executionMode ?? DEFAULT_CONFIG.strategyModes[strategy];
+  if (!VALID_MODES.includes(effectiveMode)) {
+    effectiveMode = DEFAULT_CONFIG.strategyModes[strategy];
+  }
   const dispatchOpts = { ...config, executionMode: effectiveMode };
 
-  switch (strategy) {
-    case "parallel": {
-      const taskResults = await executeParallel(tasks, resolvedModels, dispatchOpts);
-      return {
-        strategy,
-        executionMode: effectiveMode,
-        tasks: taskResults,
-        totalDurationMs: Date.now() - start,
-      };
+  try {
+    switch (strategy) {
+      case "parallel": {
+        const taskResults = await executeParallel(tasks, resolvedModels, dispatchOpts);
+        return { strategy, executionMode: effectiveMode, tasks: taskResults, totalDurationMs: Date.now() - start };
+      }
+      case "debate": {
+        const { taskResults, synthesis } = await executeDebate(tasks, resolvedModels, dispatchOpts);
+        return { strategy, executionMode: effectiveMode, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
+      }
+      case "chain": {
+        const taskResults = await executeChain(tasks, resolvedModels, dispatchOpts);
+        return { strategy, executionMode: effectiveMode, tasks: taskResults, totalDurationMs: Date.now() - start };
+      }
+      case "ensemble": {
+        const { taskResults, synthesis } = await executeEnsemble(tasks, resolvedModels, dispatchOpts);
+        return { strategy, executionMode: effectiveMode, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
+      }
+      default:
+        return { strategy, executionMode: "print", tasks: [], error: `Unknown strategy: ${strategy}`, totalDurationMs: 0 };
     }
-
-    case "debate": {
-      const { taskResults, synthesis } = await executeDebate(tasks, resolvedModels, dispatchOpts);
-      return { strategy, executionMode: effectiveMode, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
-    }
-
-    case "chain": {
-      const taskResults = await executeChain(tasks, resolvedModels, dispatchOpts);
-      return { strategy, executionMode: effectiveMode, tasks: taskResults, totalDurationMs: Date.now() - start };
-    }
-
-    case "ensemble": {
-      const { taskResults, synthesis } = await executeEnsemble(tasks, resolvedModels, dispatchOpts);
-      return { strategy, executionMode: effectiveMode, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
-    }
-
-    default:
-      return {
-        strategy,
-        executionMode: "print",
-        tasks: [],
-        error: `Unknown strategy: ${strategy}`,
-        totalDurationMs: 0,
-      };
+  } catch (e: any) {
+    return { strategy, executionMode: effectiveMode, tasks: [], error: `Dispatch failed: ${e?.message ?? String(e)}`, totalDurationMs: Date.now() - start };
   }
 }
 

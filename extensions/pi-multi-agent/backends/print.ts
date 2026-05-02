@@ -94,7 +94,7 @@ function runPi(
   return new Promise((resolve, reject) => {
     const child = spawn("pi", args, {
       env,
-      stdio: ["pipe", "pipe", fs.openSync(logFile, "w")],
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
     let stdout = "";
