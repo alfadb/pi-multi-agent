@@ -72,7 +72,7 @@ async function spawnPane(
 
   const { stdout: paneId } = await execFileP("tmux", args);
   const newId = paneId.trim();
-  console.error(`[pi-multi-agent] Spawned pane ${newId} for "${label}" (split from ${mainPaneId})`);
+  console.error(`[pi-multi-agent] Spawned pane ${newId} for "${label}" (split from ${mainPaneId}, index=${index})`);
 
   if (index > 0) {
     try { await execFileP("tmux", ["select-layout", "tiled"]); } catch {}
@@ -307,7 +307,11 @@ export async function executeTmuxPrint(
       const label = task.role ?? task.id;
       const fullCmd = `echo '=== START:${task.id} ===' && ${piCmd}; echo ''; echo '=== DONE:${task.id} ==='; echo 'Press Enter to close...'; read`;
 
+      console.error(`[pi-multi-agent] CMD for ${task.id}: ${fullCmd.slice(0, 300)}...`);
+      fs.writeFileSync(path.join(tmpDir, `${task.id}-cmd.sh`), fullCmd, "utf8");
+
       const pane = await spawnPane(mainPaneId, label, fullCmd, i);
+      console.error(`[pi-multi-agent] Pane spawned: ${pane.paneId} for ${task.id}`);
       panes.push({ taskId: task.id, paneId: pane.paneId });
     }
 
@@ -318,7 +322,7 @@ export async function executeTmuxPrint(
     for (const { taskId, paneId } of panes) {
       const task = tasks.find((t) => t.id === taskId)!;
       const marker = `=== DONE:${taskId} ===`;
-      const raw = await waitForMarker(paneId, marker, opts.taskTimeoutMs);
+      console.error("[pi-multi-agent] Waiting for marker..."); const raw = await waitForMarker(paneId, marker, opts.taskTimeoutMs);
 
       let output = "";
       let error: string | undefined;
