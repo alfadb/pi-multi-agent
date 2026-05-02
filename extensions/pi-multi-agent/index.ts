@@ -361,11 +361,6 @@ export default function (pi: ExtensionAPI) {
           body: JSON.stringify({
             model: params.model || "gpt-image-2",
             input: params.prompt,
-            image_generation: {
-              quality: params.quality || "hd",
-              size: params.size || "1024x1024",
-              output_format: "png",
-            },
           }),
         });
 
