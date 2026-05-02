@@ -43,7 +43,8 @@ async function selectPane(paneId: string): Promise<void> {
   await execFileP("tmux", ["select-pane", "-t", paneId]);
 }
 
-/** Split a new pane from the main pane, run a command, return its ID. */
+/** Split a new pane from the main pane, run a command, return its ID.
+ * Uses -P flag to print the new pane ID directly (avoids ambiguity). */
 async function spawnPane(
   mainPaneId: string,
   label: string,
@@ -53,26 +54,20 @@ async function spawnPane(
   // Always select main pane first so splits are from the right place
   await selectPane(mainPaneId);
 
-  // Escape single quotes in command for bash -c
   const safeCmd = command.replace(/'/g, `'\\''`);
 
-  if (index === 0) {
-    await execFileP("tmux", [
-      "split-window", "-t", mainPaneId, "-h", "-l", "80",
-      "bash", "-c", safeCmd,
-    ]);
-  } else {
-    await execFileP("tmux", [
-      "split-window", "-t", mainPaneId, "-v", "-l", "15",
-      "bash", "-c", safeCmd,
-    ]);
+  const args = [
+    "split-window", "-P", "-F", "#{pane_id}",
+    "-t", mainPaneId,
+    ...(index === 0 ? ["-h", "-l", "80"] : ["-v", "-l", "15"]),
+    "bash", "-c", safeCmd,
+  ];
+
+  const { stdout: paneId } = await execFileP("tmux", args);
+
+  if (index > 0) {
     try { await execFileP("tmux", ["select-layout", "tiled"]); } catch {}
   }
-
-  // After split, the new pane is active — capture its ID
-  const { stdout: paneId } = await execFileP("tmux", [
-    "display-message", "-p", "#{pane_id}",
-  ]);
 
   // Select back to main pane so next split is from the right place
   await selectPane(mainPaneId);
