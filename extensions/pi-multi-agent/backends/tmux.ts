@@ -305,10 +305,8 @@ export async function executeTmuxPrint(
 
       const piCmd = buildPiCmd(resolved, task, opts.extraFlags, "print", promptFile);
       const label = task.role ?? task.id;
-      const fullCmd = `echo '=== START:${task.id} ===' && ${piCmd}; echo ''; echo '=== DONE:${task.id} ==='; echo 'Press Enter to close...'; read`;
-
-      console.error(`[pi-multi-agent] CMD for ${task.id}: ${fullCmd.slice(0, 300)}...`);
-      fs.writeFileSync(path.join(tmpDir, `${task.id}-cmd.sh`), fullCmd, "utf8");
+      // TEMPORARY: test with simple echo to verify pane creation
+      const fullCmd = `echo '=== START:${task.id} ===' && echo 'hello from pane' && sleep 3 && echo '' && echo '=== DONE:${task.id} ===' && read`;
 
       const pane = await spawnPane(mainPaneId, label, fullCmd, i);
       console.error(`[pi-multi-agent] Pane spawned: ${pane.paneId} for ${task.id}`);
