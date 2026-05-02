@@ -339,24 +339,17 @@ export default function (pi: ExtensionAPI) {
 
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
-        // Resolve OpenAI API key
-        const openaiModel = ctx.modelRegistry.find("openai", "gpt-4.1-mini");
-        if (!openaiModel) {
-          return { content: [{ type: "text", text: "OpenAI provider not configured. Add to models.json." }], isError: true };
-        }
-        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(openaiModel);
-        if (!auth.ok || !auth.apiKey) {
-          return { content: [{ type: "text", text: `OpenAI auth failed: ${auth.error || "no key"}` }], isError: true };
+        // Use sub2api Responses endpoint (Images API is broken on this proxy)
+        const apiKey = process.env.SUB2API_API_KEY_OPENAI || process.env.OPENAI_API_KEY;
+        if (!apiKey) {
+          return { content: [{ type: "text", text: "No OpenAI API key found. Set OPENAI_API_KEY or SUB2API_API_KEY_OPENAI." }], isError: true };
         }
 
-        // Call gpt-image-2 via Responses API (not Images API — sub2api doesn't support that)
-        const baseUrl = openaiModel.baseUrl || "https://api.openai.com";
-        const cleanBase = baseUrl.replace(/\/v1\/?$/, "");
-        const response = await fetch(`${cleanBase}/v1/responses`, {
+        const response = await fetch("https://sub2api.alfadb.cn/v1/responses", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "Authorization": `Bearer ${auth.apiKey}`,
+            "Authorization": `Bearer ${apiKey}`,
           },
           body: JSON.stringify({
             model: params.model || "gpt-image-2",
