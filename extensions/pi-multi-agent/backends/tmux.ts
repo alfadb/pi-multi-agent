@@ -323,7 +323,23 @@ export async function executeTmuxPrint(
       let output = "";
       let error: string | undefined;
 
-      if (raw) {
+      // null = real timeout, empty string = pane died with no output
+      if (raw === null) {
+        error = `Timed out after ${opts.taskTimeoutMs}ms`;
+        // Try final capture from possibly-dead pane
+        const final = await capturePane(paneId);
+        output = final
+          .replace(new RegExp(`=== START:${taskId} ===`, "g"), "")
+          .replace(new RegExp(`=== DONE:${taskId} ===`, "g"), "")
+          .replace(/Press Enter to close\.\.\./g, "")
+          .trim();
+      } else if (!raw.includes(marker)) {
+        // Pane returned output but no marker — likely died early
+        error = `Pane exited without DONE marker (captured ${raw.length} chars)`;
+        output = raw
+          .replace(new RegExp(`=== START:${taskId} ===`, "g"), "")
+          .trim();
+      } else {
         const startIdx = raw.indexOf(`=== START:${taskId} ===`);
         const endIdx = raw.indexOf(marker);
         if (startIdx !== -1 && endIdx !== -1) {
@@ -331,14 +347,6 @@ export async function executeTmuxPrint(
         } else {
           output = raw.slice(0, raw.indexOf(marker)).trim();
         }
-      } else {
-        error = `Timed out after ${opts.taskTimeoutMs}ms`;
-        const final = await capturePane(paneId);
-        output = final
-          .replace(new RegExp(`=== START:${taskId} ===`, "g"), "")
-          .replace(new RegExp(`=== DONE:${taskId} ===`, "g"), "")
-          .replace(/Press Enter to close\.\.\./g, "")
-          .trim();
       }
 
       await killPane(paneId, mainPaneId, task.role ?? taskId);
@@ -356,8 +364,8 @@ export async function executeTmuxPrint(
     return results;
   } finally {
     // Cleanup any remaining panes (should be none, but be safe)
-    for (const { paneId } of panes) {
-      try { await killPane(paneId, mainPaneId, task.role ?? taskId); } catch {}
+    for (const entry of panes) {
+      try { await killPane(entry.paneId, mainPaneId, entry.taskId); } catch {}
     }
     // Ensure we're back in main pane
     try { await selectPane(mainPaneId); } catch {}
@@ -422,7 +430,18 @@ export async function executeTmuxRpc(
       let output = "";
       let error: string | undefined;
 
-      if (raw) {
+      // null = real timeout, non-null but no marker = pane died early
+      if (raw === null) {
+        error = `Timed out after ${opts.taskTimeoutMs}ms`;
+        const final = await capturePane(paneId);
+        output = final
+          .replace(new RegExp(`=== START:${taskId} ===`, "g"), "")
+          .replace(new RegExp(`=== DONE:${taskId} ===`, "g"), "")
+          .trim();
+      } else if (!raw.includes(marker)) {
+        error = `Pane exited without DONE marker (captured ${raw.length} chars)`;
+        output = raw.replace(new RegExp(`=== START:${taskId} ===`, "g"), "").trim();
+      } else {
         const startIdx = raw.indexOf(`=== START:${taskId} ===`);
         const endIdx = raw.indexOf(marker);
         const body = startIdx !== -1 && endIdx !== -1
@@ -433,13 +452,6 @@ export async function executeTmuxRpc(
         output = rounds.length > 0
           ? rounds.map((r, j) => `## Round ${j + 1}\n\n${r}`).join("\n\n---\n\n")
           : body.trim();
-      } else {
-        error = `Timed out after ${opts.taskTimeoutMs}ms`;
-        const final = await capturePane(paneId);
-        output = final
-          .replace(new RegExp(`=== START:${taskId} ===`, "g"), "")
-          .replace(new RegExp(`=== DONE:${taskId} ===`, "g"), "")
-          .trim();
       }
 
       await killPane(paneId, mainPaneId, task.role ?? taskId);
@@ -456,8 +468,8 @@ export async function executeTmuxRpc(
 
     return results;
   } finally {
-    for (const { paneId } of panes) {
-      try { await killPane(paneId, mainPaneId, task.role ?? taskId); } catch {}
+    for (const entry of panes) {
+      try { await killPane(entry.paneId, mainPaneId, entry.taskId); } catch {}
     }
     try { await selectPane(mainPaneId); } catch {}
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
