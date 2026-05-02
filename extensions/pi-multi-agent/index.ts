@@ -477,31 +477,35 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `Auth failed for vision model: ${auth.error || "no key"}` }], isError: true };
         }
 
-        // Call the vision model via completeSimple
-        const { completeSimple } = await import("@mariozechner/pi-ai");
-        const response = await completeSimple(
-          bestVision,
-          {
-            messages: [{
-              role: "user",
-              content: [
-                { type: "text", text: params.prompt },
-                { type: "image", data: imageBase64, mimeType },
-              ],
-              timestamp: Date.now(),
-            }],
-          },
-          {
-            apiKey: auth.apiKey,
-            headers: auth.headers,
-            maxTokens: 4096,
-          },
-        );
+        // Call vision model via pi --print (ensures image data is properly passed)
+        const { spawn } = await import("node:child_process");
+        const tmpPrompt = path.join(os.tmpdir(), `pi-ma-vision-${Date.now()}.md`);
+        fs.writeFileSync(tmpPrompt, params.prompt, "utf8");
 
-        const text = response.content
-          .filter((c: any) => c.type === "text")
-          .map((c: any) => c.text)
-          .join("\n");
+        const result = await new Promise<string>((resolve, reject) => {
+          const child = spawn("pi", [
+            "--model", `${bestVision.provider}/${bestVision.id}`,
+            "--thinking", "off",
+            "--print",
+            "--no-session",
+            `@${params.path || tmpPrompt}`,
+            params.prompt,
+          ], {
+            env: { ...process.env, [`${bestVision.provider.toUpperCase()}_API_KEY`]: auth.apiKey },
+            stdio: ["pipe", "pipe", "pipe"],
+            timeout: 120_000,
+          });
+
+          let stdout = "";
+          child.stdout?.on("data", (c: Buffer) => { stdout += c.toString(); });
+          child.on("error", reject);
+          child.on("close", (code) => {
+            if (code === 0) resolve(stdout.trim());
+            else reject(new Error(`pi exited with code ${code}`));
+          });
+        });
+
+        const text = result;
 
         return {
           content: [{ type: "text", text: `## Vision Analysis (${bestVision.provider}/${bestVision.id})\n\n${text}` }],
