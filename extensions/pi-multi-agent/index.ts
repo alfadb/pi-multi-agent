@@ -121,6 +121,34 @@ async function resolveMode(
   return DEFAULT_CONFIG.strategyModes[strategy];
 }
 
+/** Build per-task round prompts from debate results for tmux replay. */
+function buildDebateRounds(
+  tasks: Task[],
+  debateResults: TaskResult[],
+  totalRounds: number,
+): Map<string, string[]> {
+  const map = new Map<string, string[]>();
+
+  for (const task of tasks) {
+    const result = debateResults.find((r) => r.taskId === task.id);
+    const output = result?.output ?? "";
+
+    // Split the joined output back into rounds (separated by "---")
+    const parts = output.split(/\n---\n/);
+    const rounds: string[] = [];
+
+    for (let r = 0; r < totalRounds; r++) {
+      const part = parts[r] ?? "";
+      const clean = part.replace(/^## Round \d+\s*\n+/m, "").trim();
+      rounds.push(clean || `(Round ${r + 1} output not available)`);
+    }
+
+    map.set(task.id, rounds);
+  }
+
+  return map;
+}
+
 // ── Strategy dispatch ────────────────────────────────────────────
 
 async function dispatch(
@@ -159,9 +187,6 @@ async function dispatch(
     }
 
     case "debate": {
-      if (effectiveMode === "tmux") {
-        console.log("[pi-multi-agent] tmux not supported for debate, using rpc");
-      }
       const debateMode = effectiveMode === "tmux" ? "rpc" : effectiveMode;
       const debateOpts = { ...dispatchOpts, executionMode: debateMode };
       const { taskResults: dr, synthesis: ds } = await executeDebate(
@@ -169,6 +194,18 @@ async function dispatch(
         resolvedModels,
         debateOpts,
       );
+
+      // For tmux mode: also show the debate rounds visually
+      if (effectiveMode === "tmux") {
+        // Run the same debate rounds in tmux panes for visibility
+        // Build per-task round prompts from debate results
+        const roundsPerTask = buildDebateRounds(tasks, dr, opts.debateRounds ?? 2);
+        await executeTmux(tasks, resolvedModels, {
+          taskTimeoutMs: config.timeoutMs,
+          extraFlags: config.extraFlags,
+        }, roundsPerTask);
+      }
+
       return {
         strategy,
         executionMode: debateMode,
@@ -179,15 +216,22 @@ async function dispatch(
     }
 
     case "chain": {
-      if (effectiveMode === "tmux") {
-        console.log("[pi-multi-agent] tmux not supported for chain, using rpc");
-      }
       const chainMode = effectiveMode === "tmux" ? "rpc" : effectiveMode;
       const chainOpts = { ...dispatchOpts, executionMode: chainMode };
-      const taskResults = await executeChain(tasks, resolvedModels, chainOpts);
+      let taskResults = await executeChain(tasks, resolvedModels, chainOpts);
+
+      // For tmux mode: also show the chain visually
+      // Chain is sequential by nature, but we can show each step in its own pane
+      if (effectiveMode === "tmux") {
+        taskResults = await executeTmux(tasks, resolvedModels, {
+          taskTimeoutMs: config.timeoutMs,
+          extraFlags: config.extraFlags,
+        });
+      }
+
       return {
         strategy,
-        executionMode: chainMode,
+        executionMode: taskResults.length > 0 ? chainMode : effectiveMode,
         tasks: taskResults,
         totalDurationMs: Date.now() - start,
       };

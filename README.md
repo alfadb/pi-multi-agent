@@ -19,6 +19,7 @@ Register a single tool — `multi_dispatch` — that lets the LLM spawn parallel
 |---|---|---|
 | `print` | `pi --print` subprocess | Stateless single-turn analysis |
 | `rpc` | `pi --mode rpc` subprocess | Multi-turn debate/chain |
+| `tmux` | tmux panes + `pi --print` or `pi --mode rpc` | Visible real-time, multi-turn supported |
 | `sdk` | (planned) In-process AgentSession | Tight orchestration |
 
 ## Install
