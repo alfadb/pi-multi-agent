@@ -1,0 +1,11 @@
+{
+  "name": "pi-multi-agent",
+  "version": "0.1.0",
+  "description": "Multi-model parallel agent dispatch for pi coding agent — debate, chain, ensemble, and parallel strategies via print, rpc, or sdk backends",
+  "keywords": ["pi-package", "pi-extension", "multi-agent", "parallel"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions/pi-multi-agent"],
+    "image": "https://github.com/alfadb/pi-multi-agent/raw/main/docs/pi-multi-agent.png"
+  }
+}
