@@ -477,50 +477,39 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `Auth failed for vision model: ${auth.error || "no key"}` }], isError: true };
         }
 
-        // Call vision model via pi --print
-        const args = [
-          "--model", `${bestVision.provider}/${bestVision.id}`,
-          "--thinking", "off",
-          "--print",
-          "--no-session",
-        ];
-
-        // Pass image via @path syntax (must be absolute)
+        // Call pi --print with @path (use execFileSync — spawn fails in extension context)
+        const { execFileSync } = await import("node:child_process");
         const resolvedPath = params.path ? path.resolve(params.path) : "";
-        if (resolvedPath) {
-          args.push(`@${resolvedPath}`);
+
+        if (!resolvedPath) {
+          return { content: [{ type: "text", text: "No image path provided. Pass path to image file." }], isError: true };
         }
 
-        // Prompt
-        const promptArg = params.prompt || "Describe this image";
-        args.push(promptArg);
-
-        const { spawn } = await import("node:child_process");
-
-        const result = await new Promise<string>((resolve, reject) => {
-          const child = spawn("pi", args, {
+        try {
+          const result = execFileSync("pi", [
+            "--model", `${bestVision.provider}/${bestVision.id}`,
+            "--thinking", "off",
+            "--print",
+            "--no-session",
+            `@${resolvedPath}`,
+            params.prompt || "Describe this image",
+          ], {
             env: { ...process.env, [`${bestVision.provider.toUpperCase()}_API_KEY`]: auth.apiKey },
-            stdio: ["pipe", "pipe", "pipe"],
+            encoding: "utf8",
             timeout: 120_000,
+            maxBuffer: 10 * 1024 * 1024,
           });
 
-          let stdout = "";
-          let stderr = "";
-          child.stdout?.on("data", (c: Buffer) => { stdout += c.toString(); });
-          child.stderr?.on("data", (c: Buffer) => { stderr += c.toString(); });
-          child.on("error", reject);
-          child.on("close", (code) => {
-            if (code === 0) resolve(stdout.trim());
-            else reject(new Error(`pi exited with code ${code}: ${stderr.slice(-300)}`));
-          });
-        });
+          const text = result.trim();
 
-        const text = result;
-
-        return {
-          content: [{ type: "text", text: `## Vision Analysis (${bestVision.provider}/${bestVision.id})\n\n${text}` }],
-          details: { model: `${bestVision.provider}/${bestVision.id}` },
-        };
+          return {
+            content: [{ type: "text", text: `## Vision Analysis (${bestVision.provider}/${bestVision.id})\n\n${text}` }],
+            details: { model: `${bestVision.provider}/${bestVision.id}` },
+          };
+        } catch (e: any) {
+          const stderr = e?.stderr || e?.message || String(e);
+          return { content: [{ type: "text", text: `Vision analysis failed: ${stderr.slice(0, 500)}` }], isError: true };
+        }
       } catch (e: any) {
         return { content: [{ type: "text", text: `Vision analysis error: ${e?.message || String(e)}` }], isError: true };
       }
