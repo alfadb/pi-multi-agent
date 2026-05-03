@@ -348,16 +348,27 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: "No OpenAI API key found. Set OPENAI_API_KEY or SUB2API_API_KEY_OPENAI." }], isError: true };
         }
 
+        // Build request body. The Responses endpoint takes size/quality at the top level
+        // for image_generation_call. Verified 2026-05-03 against sub2api/v1/responses:
+        //   - size is honored (1024x1024 / 1792x1024 / 1024x1792)
+        //   - quality field is currently coerced to "low" by the sub2api proxy regardless
+        //     of the requested value; we still send it so it takes effect when the proxy
+        //     limit is relaxed or when pointing at the upstream OpenAI API directly.
+        // style is intentionally not an API param — it's expected to be encoded in the prompt.
+        const reqBody: Record<string, unknown> = {
+          model: params.model || "gpt-image-2",
+          input: params.prompt,
+        };
+        if (params.size) reqBody.size = params.size;
+        if (params.quality) reqBody.quality = params.quality;
+
         const response = await fetch("https://sub2api.alfadb.cn/v1/responses", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             "Authorization": `Bearer ${apiKey}`,
           },
-          body: JSON.stringify({
-            model: params.model || "gpt-image-2",
-            input: params.prompt,
-          }),
+          body: JSON.stringify(reqBody),
         });
 
         if (!response.ok) {
@@ -367,11 +378,16 @@ export default function (pi: ExtensionAPI) {
 
         const data = await response.json() as any;
 
-        // Extract base64 image from Responses API output
+        // Extract base64 image from Responses API output, plus the actual size/quality
+        // the model used (so the saved file metadata reflects reality, not the request).
         let imageBase64 = "";
+        let actualSize: string | undefined;
+        let actualQuality: string | undefined;
         for (const item of data?.output ?? []) {
           if (item.type === "image_generation_call" && item.result) {
             imageBase64 = item.result;
+            actualSize = item.size;
+            actualQuality = item.quality;
             break;
           }
         }
@@ -387,10 +403,18 @@ export default function (pi: ExtensionAPI) {
         const filepath = path.join(outDir, filename);
         try { fs.writeFileSync(filepath, Buffer.from(imageBase64, "base64")); } catch {}
 
-        // Return both the image (if model supports it) and the file path
+        // Return both the image (if model supports it) and the file path.
+        // Report the actual size/quality the API used, falling back to requested.
         const result: any = {
-          content: [{ type: "text", text: `✅ Image saved: ${filepath}` }],
-          details: { model: params.model || "gpt-image-2", size: params.size, quality: params.quality, path: filepath },
+          content: [{ type: "text", text: `✅ Image saved: ${filepath} (${actualSize ?? params.size ?? "default"}, quality=${actualQuality ?? params.quality ?? "default"})` }],
+          details: {
+            model: params.model || "gpt-image-2",
+            requestedSize: params.size,
+            actualSize,
+            requestedQuality: params.quality,
+            actualQuality,
+            path: filepath,
+          },
         };
 
         // If current model supports images, also return the base64
