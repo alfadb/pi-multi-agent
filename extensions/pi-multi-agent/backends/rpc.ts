@@ -8,6 +8,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import type { Task, TaskResult, ResolvedModel } from "../types.js";
+import { resolvePiCommand } from "../pi-resolver.js";
 
 export interface RpcBackendOptions {
   taskTimeoutMs: number;
@@ -56,9 +57,12 @@ export async function executeRpc(
       [`${resolved.provider.toUpperCase()}_API_KEY`]: resolved.apiKey,
     };
 
-    const proc = spawn("pi", args, {
+    const pi = resolvePiCommand();
+    const proc = spawn(pi.command, [...pi.prefixArgs, ...args], {
       env,
       stdio: ["pipe", "pipe", "pipe"],
+      shell: pi.shell,
+      windowsHide: true,
     });
 
     let stdout = "";

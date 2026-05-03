@@ -501,8 +501,10 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `Auth failed for vision model: ${auth.error || "no key"}` }], isError: true };
         }
 
-        // Call pi --print with @path (use execFileSync — spawn fails in extension context)
+        // Call pi --print with @path. Use execFileSync with resolved CLI path —
+        // bare "pi" fails on Windows (Node spawn won't run .cmd shims without shell:true).
         const { execFileSync } = await import("node:child_process");
+        const { resolvePiCommand } = await import("./pi-resolver.js");
         const resolvedPath = params.path ? path.resolve(params.path) : "";
 
         if (!resolvedPath) {
@@ -510,7 +512,8 @@ export default function (pi: ExtensionAPI) {
         }
 
         try {
-          const result = execFileSync("pi", [
+          const pi = resolvePiCommand();
+          const result = execFileSync(pi.command, [...pi.prefixArgs,
             "--model", `${bestVision.provider}/${bestVision.id}`,
             "--thinking", "off",
             "--print",
@@ -522,6 +525,8 @@ export default function (pi: ExtensionAPI) {
             encoding: "utf8",
             timeout: 120_000,
             maxBuffer: 10 * 1024 * 1024,
+            shell: pi.shell,
+            windowsHide: true,
           });
 
           const text = result.trim();

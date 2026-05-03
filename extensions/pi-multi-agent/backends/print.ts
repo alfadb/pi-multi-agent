@@ -8,6 +8,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import type { Task, TaskResult, ResolvedModel } from "../types.js";
+import { resolvePiCommand } from "../pi-resolver.js";
 
 export interface PrintBackendOptions {
   taskTimeoutMs: number;
@@ -92,9 +93,12 @@ function runPi(
   timeoutMs: number,
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn("pi", args, {
+    const pi = resolvePiCommand();
+    const child = spawn(pi.command, [...pi.prefixArgs, ...args], {
       env,
       stdio: ["pipe", "pipe", "pipe"],
+      shell: pi.shell,
+      windowsHide: true,
     });
 
     let stdout = "";
