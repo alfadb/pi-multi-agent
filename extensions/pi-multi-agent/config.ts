@@ -18,6 +18,15 @@ export interface MultiAgentConfig {
   synthesisThinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   /** Extra CLI flags passed to pi subprocesses. */
   extraPiFlags: string[];
+  /**
+   * Vision tool: ordered preference list, most-preferred first.
+   * Each entry is "provider/idSubstring" — substring match on model id (case-insensitive),
+   * tolerant of version suffixes (e.g. "openai/gpt-5.5-pro" matches "gpt-5.5-pro-2026-07-15").
+   * Models matching earlier entries win. Unmatched models still participate, ordered by
+   * cost.input descending as a rough capability proxy.
+   * The current main model is always excluded (if it supported images, vision wouldn't be called).
+   */
+  visionModelPreferences: string[];
 }
 
 export const DEFAULT_CONFIG: MultiAgentConfig = {
@@ -31,6 +40,16 @@ export const DEFAULT_CONFIG: MultiAgentConfig = {
   debateRounds: 2,
   synthesisThinking: "high",
   extraPiFlags: [],
+  visionModelPreferences: [
+    "openai/gpt-5.5-pro",
+    "openai/gpt-5.5",
+    "anthropic/claude-opus-4-7",
+    "openai/gpt-5",
+    "anthropic/claude-opus",
+    "openai/gpt-4.1",
+    "anthropic/claude-sonnet",
+    "google/gemini",
+  ],
 };
 
 function readJsonSafe(p: string): Record<string, unknown> {
@@ -56,5 +75,8 @@ export function loadConfig(projectRoot: string): MultiAgentConfig {
       DEFAULT_CONFIG.synthesisThinking,
     extraPiFlags:
       (projectConfig.extraPiFlags as string[]) ?? DEFAULT_CONFIG.extraPiFlags,
+    visionModelPreferences:
+      (projectConfig.visionModelPreferences as string[]) ??
+      DEFAULT_CONFIG.visionModelPreferences,
   };
 }

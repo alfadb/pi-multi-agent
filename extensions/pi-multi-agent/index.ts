@@ -441,7 +441,7 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Analyze image: vision(imageBase64, prompt)",
     promptGuidelines: [
       "Use vision when the user provides an image (screenshot, photo, diagram) and the current model cannot process images.",
-      "The tool auto-selects the best vision model available: gpt-5.5-pro > gpt-5.5 > claude-opus-4-7 > gpt-4.1.",
+      "Auto-selects from available vision-capable models per .pi-multi-agent/config.json visionModelPreferences (built-in defaults cover OpenAI/Anthropic/Google).",
       "Returns the text analysis from the vision model.",
     ],
     parameters: Type.Object({
@@ -473,26 +473,39 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: "No image provided. Pass imageBase64 or path." }], isError: true };
         }
 
-        // Find best vision model
+        // Load user preferences (project-local override of built-in defaults)
+        const cfg = loadConfig(ctx.cwd || process.cwd());
+        const prefs = cfg.visionModelPreferences ?? [];
+
+        // Score: lower index = more preferred. Unmatched -> prefs.length (sorted by cost after).
+        const scorePref = (m: any): number => {
+          const id = String(m.id || "").toLowerCase();
+          for (let i = 0; i < prefs.length; i++) {
+            const slash = prefs[i].indexOf("/");
+            if (slash < 0) continue;
+            const pProv = prefs[i].slice(0, slash);
+            const pPat = prefs[i].slice(slash + 1).toLowerCase();
+            if (m.provider === pProv && id.includes(pPat)) return i;
+          }
+          return prefs.length;
+        };
+
+        const isMain = (m: any) =>
+          ctx.model && m.provider === ctx.model.provider && m.id === ctx.model.id;
+
         const visionModels = (await ctx.modelRegistry.getAvailable())
           .filter((m: any) => m.input?.includes("image"))
+          .filter((m: any) => !isMain(m))
+          .map((m: any) => ({ m, pref: scorePref(m) }))
           .sort((a: any, b: any) => {
-            const rank = (m: any) => {
-              const id = m.id.toLowerCase();
-              if (m.provider === "openai" && id.includes("gpt-5.5-pro")) return 10;
-              if (m.provider === "openai" && id.includes("gpt-5.5")) return 9;
-              if (m.provider === "anthropic" && id.includes("opus-4-7")) return 8;
-              if (m.provider === "openai" && id.includes("gpt-5")) return 7;
-              if (m.provider === "anthropic" && id.includes("opus")) return 6;
-              if (m.provider === "openai" && id.includes("gpt-4.1")) return 5;
-              if (m.provider === "anthropic" && id.includes("sonnet")) return 4;
-              return 0;
-            };
-            return rank(b) - rank(a);
-          });
+            if (a.pref !== b.pref) return a.pref - b.pref;
+            // Same pref bucket: pricier input ≈ stronger model (rough proxy)
+            return (b.m.cost?.input ?? 0) - (a.m.cost?.input ?? 0);
+          })
+          .map((x: any) => x.m);
 
         if (visionModels.length === 0) {
-          return { content: [{ type: "text", text: "No vision-capable model available. Configure OpenAI or Anthropic with image support." }], isError: true };
+          return { content: [{ type: "text", text: "No vision-capable model available (other than the current main model). Configure another provider with image support." }], isError: true };
         }
 
         const bestVision = visionModels[0];
@@ -501,43 +514,54 @@ export default function (pi: ExtensionAPI) {
           return { content: [{ type: "text", text: `Auth failed for vision model: ${auth.error || "no key"}` }], isError: true };
         }
 
-        // Call pi --print with @path. Use execFileSync with resolved CLI path —
-        // bare "pi" fails on Windows (Node spawn won't run .cmd shims without shell:true).
-        const { execFileSync } = await import("node:child_process");
-        const { resolvePiCommand } = await import("./pi-resolver.js");
-        const resolvedPath = params.path ? path.resolve(params.path) : "";
-
-        if (!resolvedPath) {
-          return { content: [{ type: "text", text: "No image path provided. Pass path to image file." }], isError: true };
-        }
-
+        // In-process call via pi-ai streamSimple — no subprocess, no ETIMEDOUT,
+        // no Windows .cmd shim issues. Image is sent as native ImageContent part.
         try {
-          const pi = resolvePiCommand();
-          const result = execFileSync(pi.command, [...pi.prefixArgs,
-            "--model", `${bestVision.provider}/${bestVision.id}`,
-            "--thinking", "off",
-            "--print",
-            "--no-session",
-            `@${resolvedPath}`,
-            params.prompt || "Describe this image",
-          ], {
-            env: { ...process.env, [`${bestVision.provider.toUpperCase()}_API_KEY`]: auth.apiKey },
-            encoding: "utf8",
-            timeout: 120_000,
-            maxBuffer: 10 * 1024 * 1024,
-            shell: pi.shell,
-            windowsHide: true,
+          const piAi: any = await import("@mariozechner/pi-ai");
+          const userMsg = {
+            role: "user" as const,
+            content: [
+              { type: "image" as const, data: imageBase64, mimeType },
+              { type: "text" as const, text: params.prompt || "Describe this image" },
+            ],
+            timestamp: Date.now(),
+          };
+          const context = { messages: [userMsg] };
+          const stream = piAi.streamSimple(bestVision, context, {
+            apiKey: auth.apiKey,
+            headers: auth.headers,
+            signal: _signal,
+            timeoutMs: 120_000,
+            maxRetries: 1,
           });
+          const finalMsg = await stream.result();
 
-          const text = result.trim();
+          if (finalMsg.stopReason === "error" || finalMsg.stopReason === "aborted") {
+            const reason = finalMsg.errorMessage || finalMsg.stopReason;
+            return { content: [{ type: "text", text: `Vision analysis failed (${bestVision.provider}/${bestVision.id}): ${reason}` }], isError: true };
+          }
+
+          const text = (finalMsg.content as any[])
+            .filter((c) => c?.type === "text")
+            .map((c) => c.text)
+            .join("\n")
+            .trim();
+
+          if (!text) {
+            return { content: [{ type: "text", text: `Vision model returned no text (stopReason=${finalMsg.stopReason}).` }], isError: true };
+          }
 
           return {
             content: [{ type: "text", text: `## Vision Analysis (${bestVision.provider}/${bestVision.id})\n\n${text}` }],
-            details: { model: `${bestVision.provider}/${bestVision.id}` },
+            details: {
+              model: `${bestVision.provider}/${bestVision.id}`,
+              usage: finalMsg.usage,
+              candidates: visionModels.slice(0, 5).map((m: any) => `${m.provider}/${m.id}`),
+            },
           };
         } catch (e: any) {
-          const stderr = e?.stderr || e?.message || String(e);
-          return { content: [{ type: "text", text: `Vision analysis failed: ${stderr.slice(0, 500)}` }], isError: true };
+          const msg = e?.message || String(e);
+          return { content: [{ type: "text", text: `Vision analysis failed (${bestVision.provider}/${bestVision.id}): ${msg.slice(0, 500)}` }], isError: true };
         }
       } catch (e: any) {
         return { content: [{ type: "text", text: `Vision analysis error: ${e?.message || String(e)}` }], isError: true };
