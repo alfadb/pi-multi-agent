@@ -6,9 +6,10 @@
  * inline display (when the *caller's* model supports image input).
  */
 
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as os from "node:os";
+import * as crypto from "node:crypto";
 
 export interface ImagineInput {
   prompt: string;
@@ -61,13 +62,28 @@ export async function generateImage(input: ImagineInput, deps: ImagineDeps): Pro
     };
   }
 
+  // Style is intentionally not an OpenAI Responses API param — it's encoded
+  // into the prompt because the Images API accepts "vivid"/"natural" but the
+  // Responses image_generation_call path does not. Honor the contract by
+  // appending a style hint to the prompt itself.
+  const styledPrompt = input.style
+    ? `${input.prompt}\n\n[Style: ${input.style}]`
+    : input.prompt;
+
   const reqBody: Record<string, unknown> = {
     model: input.model || "gpt-image-2",
-    input: input.prompt,
+    input: styledPrompt,
   };
   if (input.size) reqBody.size = input.size;
   if (input.quality) reqBody.quality = input.quality;
 
+  // NOTE: this endpoint is the alfadb-internal sub2api proxy, not OpenAI direct.
+  // The proxy forwards to upstream OpenAI but rewrites quality/auth headers.
+  // Both SUB2API_API_KEY_OPENAI and OPENAI_API_KEY are accepted; either way
+  // the credential is sent to a *third party* (sub2api.alfadb.cn), not
+  // OpenAI directly. Document this in any deployment that ships outside the
+  // alfadb infrastructure. A future change should accept OPENAI_BASE_URL to
+  // allow direct routing.
   let response: Response;
   try {
     response = await fetch("https://sub2api.alfadb.cn/v1/responses", {
@@ -110,16 +126,24 @@ export async function generateImage(input: ImagineInput, deps: ImagineDeps): Pro
   }
 
   // Save to disk under <cwd>/.pi-multi-agent-output/ (fallback to ~ if cwd missing).
+  // Use async fs to avoid blocking the event loop while writing potentially
+  // multi-MB PNG buffers — a sync write here would stall every other in-flight
+  // task in a parallel dispatch.
   const outDir = path.join(deps.cwd || os.homedir(), ".pi-multi-agent-output");
   try {
-    fs.mkdirSync(outDir, { recursive: true });
+    await fs.mkdir(outDir, { recursive: true });
   } catch {
     /* ignore */
   }
-  const filename = `image-${Date.now()}.png`;
+  // Date.now() alone collides under parallel dispatch (two subagents calling
+  // imagine in the same millisecond would silently overwrite each other).
+  // Append a 4-byte random suffix to make filenames collision-free even at
+  // submillisecond rates.
+  const suffix = crypto.randomBytes(4).toString("hex");
+  const filename = `image-${Date.now()}-${suffix}.png`;
   const filepath = path.join(outDir, filename);
   try {
-    fs.writeFileSync(filepath, Buffer.from(imageBase64, "base64"));
+    await fs.writeFile(filepath, Buffer.from(imageBase64, "base64"));
   } catch (e: any) {
     return { ok: false, error: `Failed to save image: ${e?.message ?? String(e)}` };
   }

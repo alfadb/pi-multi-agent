@@ -5,8 +5,14 @@
  * delegation stays explicit and reviewable.
  *
  * Whitelisted entries:
- *   - SDK built-ins: read, bash, edit, write, grep, find, ls
- *   - Aliases: "readonly" (=read,grep,find,ls), "coding" (=read,bash,edit,write,grep,find,ls)
+ *   - Read-only SDK built-ins: read, grep, find, ls
+ *   - Mutating SDK built-ins: bash, edit, write — GATED behind
+ *     env PI_MULTI_AGENT_ALLOW_MUTATING=1 because subagents do not surface a
+ *     user-confirmation flow. A prompt-injected subagent (e.g. via attacker-
+ *     controlled file content read by `read`) would otherwise get unsupervised
+ *     RCE in the parent's cwd, plus access to all parent env vars (API keys).
+ *   - Alias: "readonly" (= read+grep+find+ls). The historical "coding" alias
+ *     was removed because its name implied safety and it bundled write tools.
  *   - Self-delegatable multi-agent tools: vision, imagine
  *
  * Anything else (including multi_dispatch and third-party extension tools) is
@@ -21,15 +27,22 @@ import { Type } from "typebox";
 import { analyzeImage } from "./tools/vision-core.js";
 import { generateImage } from "./tools/imagine-core.js";
 
-const SDK_BUILTINS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+/** Read-only built-ins — always available to subagents. */
+const SDK_BUILTINS_READONLY = new Set(["read", "grep", "find", "ls"]);
+/** Mutating built-ins — require env opt-in. */
+const SDK_BUILTINS_MUTATING = new Set(["bash", "edit", "write"]);
 const ALIASES: Record<string, string[]> = {
   readonly: ["read", "grep", "find", "ls"],
-  coding: ["read", "bash", "edit", "write", "grep", "find", "ls"],
 };
 const MULTI_AGENT_DELEGATABLE = new Set(["vision", "imagine"]);
 
 /** Hard-coded refusal list — for clearer error messages. */
 const HARD_DENY = new Set(["multi_dispatch"]);
+
+/** Check if mutating built-ins are unlocked for subagents. */
+export function mutatingToolsAllowed(): boolean {
+  return process.env.PI_MULTI_AGENT_ALLOW_MUTATING === "1";
+}
 
 export interface SubagentToolDeps {
   cwd: string;
@@ -56,13 +69,20 @@ function expandNames(csv: string): string[] {
   return [...out];
 }
 
-/** Validate names against the whitelist. Returns rejected entries (empty = all OK). */
+/** Validate names against the whitelist. Returns rejected entries (empty = all OK).
+ *  Mutating tools (bash/edit/write) are rejected unless mutatingToolsAllowed() returns true. */
 export function validateTools(csv: string | undefined): { names: string[]; rejected: string[] } {
   if (!csv) return { names: [], rejected: [] };
   const names = expandNames(csv);
+  const allowMutating = mutatingToolsAllowed();
   const rejected: string[] = [];
   for (const n of names) {
-    if (SDK_BUILTINS.has(n)) continue;
+    if (SDK_BUILTINS_READONLY.has(n)) continue;
+    if (SDK_BUILTINS_MUTATING.has(n)) {
+      if (allowMutating) continue;
+      rejected.push(n);
+      continue;
+    }
     if (MULTI_AGENT_DELEGATABLE.has(n)) continue;
     rejected.push(n);
   }
@@ -71,18 +91,27 @@ export function validateTools(csv: string | undefined): { names: string[]; rejec
 
 /** Build a human-readable rejection message including hint when possible. */
 export function rejectionMessage(rejected: string[]): string {
+  const allowMutating = mutatingToolsAllowed();
   const lines: string[] = [
     `Task.tools rejected: ${rejected.join(", ")}`,
     "",
     "Subagent tools whitelist:",
-    "  SDK built-ins: read, bash, edit, write, grep, find, ls",
-    "  Aliases: readonly (=read,grep,find,ls), coding (=read+bash+edit+write+grep+find+ls)",
+    "  Read-only built-ins (always available): read, grep, find, ls",
+    `  Mutating built-ins (${allowMutating ? "ENABLED via PI_MULTI_AGENT_ALLOW_MUTATING=1" : "DISABLED — set PI_MULTI_AGENT_ALLOW_MUTATING=1 to enable"}): bash, edit, write`,
+    '  Alias: "readonly" (=read,grep,find,ls)',
     "  Multi-agent: vision, imagine",
   ];
   for (const r of rejected) {
     if (HARD_DENY.has(r)) {
       lines.push("");
       lines.push(`'${r}' is intentionally not delegatable to subagents (would enable nested dispatch).`);
+    } else if (SDK_BUILTINS_MUTATING.has(r) && !allowMutating) {
+      lines.push("");
+      lines.push(
+        `'${r}' is a mutating tool. Subagents have no user-confirmation flow, so a prompt-injected ` +
+        `subagent could RCE in the parent's cwd or exfiltrate API keys via env. ` +
+        `Set PI_MULTI_AGENT_ALLOW_MUTATING=1 to opt in (only when you trust every subagent prompt).`,
+      );
     }
   }
   return lines.join("\n");
@@ -101,7 +130,9 @@ export async function buildSubagentTools(
 
   // SDK built-ins via dynamic import (avoids pulling tool deps when unused).
   // pi-coding-agent exports per-name factories rather than a generic one.
-  const sdkNames = names.filter(n => SDK_BUILTINS.has(n));
+  // Note: validateTools already rejected mutating tools when mutatingToolsAllowed()
+  // is false, so by the time we reach here, only allowed names remain.
+  const sdkNames = names.filter(n => SDK_BUILTINS_READONLY.has(n) || SDK_BUILTINS_MUTATING.has(n));
   if (sdkNames.length > 0) {
     const sdk: any = await import("@mariozechner/pi-coding-agent");
     const factories: Record<string, (cwd: string) => any> = {
@@ -150,6 +181,9 @@ function makeVisionTool(deps: SubagentToolDeps): AgentTool {
         prefs: deps.visionPrefs,
         excludeMain: deps.taskModel,
         signal,
+        // Confine path-based loads to the dispatch cwd so a prompt-injected
+        // subagent can't exfil arbitrary files via a vision round-trip.
+        cwd: deps.cwd,
       });
       if (r.ok === false) {
         return { content: [{ type: "text", text: r.error }], details: { error: r.error }, isError: true };

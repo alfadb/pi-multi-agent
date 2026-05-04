@@ -5,7 +5,7 @@
  */
 
 import type { DispatchOptions, ResolvedModel, Task, TaskResult } from "../types.js";
-import { runTask, type RunnerCtx } from "../runner.js";
+import { runTask, missingModelResult, type RunnerCtx } from "../runner.js";
 
 export async function executeEnsemble(
   tasks: Task[],
@@ -16,31 +16,32 @@ export async function executeEnsemble(
   // All models answer the same prompt independently (Promise.all).
   const jobs = tasks.map((task) => {
     const resolved = resolvedModels.get(task.id);
-    if (!resolved) {
-      return Promise.resolve<TaskResult>({
-        taskId: task.id,
-        model: task.model,
-        role: task.role,
-        output: "",
-        error: `Model not found: ${task.model}`,
-        durationMs: 0,
-      });
-    }
+    if (!resolved) return Promise.resolve(missingModelResult(task));
     return runTask(task, resolved, rctx);
   });
 
   const taskResults = await Promise.all(jobs);
 
   // Synthesis pass — pick best or build consensus.
+  // Order matters: check "is there anything to synthesize?" before checking
+  // "can we resolve the synthesis model?". An all-errored dispatch is the
+  // root cause; the missing synthesis model is a downstream symptom — surface
+  // the root cause to operators instead of confusing them.
+  const successfulResults = taskResults.filter((r) => !r.error);
+  if (successfulResults.length === 0) {
+    return {
+      taskResults,
+      synthesis: "Synthesis skipped: all tasks errored, no responses to synthesize.",
+    };
+  }
+
   const synthesisModel = opts.synthesisModel ?? tasks[0].model;
   const synthesisResolved =
     resolvedModels.get("__synthesis__") ?? resolvedModels.get(tasks[0].id);
   if (!synthesisResolved) {
     return { taskResults, synthesis: "Synthesis failed: no model resolvable" };
   }
-
-  const responses = taskResults
-    .filter((r) => !r.error)
+  const responses = successfulResults
     .map(
       (r, i) =>
         `### Response ${i + 1}: ${r.role ?? r.taskId} (${r.model})\n\n${r.output}`,

@@ -10,7 +10,7 @@
  */
 
 import type { DispatchOptions, ResolvedModel, Task, TaskResult } from "../types.js";
-import { runTask, type RunnerCtx } from "../runner.js";
+import { runTask, missingModelResult, type RunnerCtx } from "../runner.js";
 
 export async function executeDebate(
   tasks: Task[],
@@ -20,47 +20,33 @@ export async function executeDebate(
 ): Promise<{ taskResults: TaskResult[]; synthesis: string }> {
   const rounds = opts.debateRounds ?? 2;
 
-  // roundResults[r] is a map: taskId → text response in round r (1-indexed below).
-  const roundResults: Map<string, string>[] = [];
+  // roundResults[r] is a map: taskId → full TaskResult for round r.
+  // Storing TaskResult (not just text) lets us accumulate durationMs across
+  // rounds and surface per-round error info — important for diagnosing why a
+  // particular debater dropped out mid-debate.
+  const roundResults: Map<string, TaskResult>[] = [];
 
   // Round 1: independent responses.
   const r1Jobs = tasks.map(async (task) => {
     const resolved = resolvedModels.get(task.id);
-    if (!resolved) {
-      return {
-        taskId: task.id,
-        model: task.model,
-        role: task.role,
-        output: "",
-        error: `Model not found: ${task.model}`,
-        durationMs: 0,
-      } as TaskResult;
-    }
+    if (!resolved) return missingModelResult(task);
     return runTask(task, resolved, rctx);
   });
   const r1Results = await Promise.all(r1Jobs);
-  roundResults.push(new Map(tasks.map((t, i) => [t.id, r1Results[i].output])));
+  roundResults.push(new Map(tasks.map((t, i) => [t.id, r1Results[i]])));
 
   // Rounds 2..N: cross-response.
   for (let r = 2; r <= rounds; r++) {
     const previousRound = roundResults[r - 2];
     const roundJobs = tasks.map(async (task, idx) => {
       const resolved = resolvedModels.get(task.id);
-      if (!resolved) {
-        return {
-          taskId: task.id,
-          model: task.model,
-          role: task.role,
-          output: "",
-          error: `Model not found: ${task.model}`,
-          durationMs: 0,
-        } as TaskResult;
-      }
+      if (!resolved) return missingModelResult(task);
 
       const othersResponses = tasks
         .filter((_, j) => j !== idx)
         .map((other) => {
-          const resp = previousRound.get(other.id) ?? "(no response)";
+          const prev = previousRound.get(other.id);
+          const resp = prev?.output || "(no response)";
           return `## ${other.role ?? other.id}'s response\n\n${resp}`;
         })
         .join("\n\n");
@@ -82,22 +68,39 @@ export async function executeDebate(
     });
 
     const roundArr = await Promise.all(roundJobs);
-    roundResults.push(new Map(tasks.map((t, i) => [t.id, roundArr[i].output])));
+    roundResults.push(new Map(tasks.map((t, i) => [t.id, roundArr[i]])));
   }
 
-  // Merge per-task results: concatenate each task's responses across all rounds.
+  // Merge per-task results: concatenate each task's outputs across all rounds
+  // and sum durationMs / token usage so the dispatch report reflects the
+  // *cumulative* cost of debating, not just round 1.
   const taskResults: TaskResult[] = tasks.map((task) => {
     const allRounds: string[] = [];
+    let totalDur = 0;
+    let firstError: string | undefined;
+    let agg: TaskResult["usage"];
     for (const rm of roundResults) {
-      const resp = rm.get(task.id);
-      if (resp) allRounds.push(resp);
+      const tr = rm.get(task.id);
+      if (!tr) continue;
+      if (tr.output) allRounds.push(tr.output);
+      totalDur += tr.durationMs;
+      if (tr.error && !firstError) firstError = tr.error;
+      if (tr.usage) {
+        agg = {
+          input: (agg?.input ?? 0) + tr.usage.input,
+          output: (agg?.output ?? 0) + tr.usage.output,
+          total: (agg?.total ?? 0) + tr.usage.total,
+        };
+      }
     }
     return {
       taskId: task.id,
       model: task.model,
       role: task.role,
       output: allRounds.join("\n\n---\n\n"),
-      durationMs: 0,
+      durationMs: totalDur,
+      ...(firstError ? { error: firstError } : {}),
+      ...(agg ? { usage: agg } : {}),
     };
   });
 
@@ -128,7 +131,7 @@ export async function executeDebate(
 
 function buildSynthesisPrompt(
   tasks: Task[],
-  roundResults: Map<string, string>[],
+  roundResults: Map<string, TaskResult>[],
   totalRounds: number,
 ): string {
   const parts: string[] = [
@@ -143,10 +146,10 @@ function buildSynthesisPrompt(
   for (let r = 0; r < totalRounds; r++) {
     parts.push(`### Round ${r + 1}`);
     for (const task of tasks) {
-      const resp = roundResults[r]?.get(task.id);
-      if (resp) {
+      const tr = roundResults[r]?.get(task.id);
+      if (tr?.output) {
         parts.push(`#### ${task.role ?? task.id}`);
-        parts.push(resp);
+        parts.push(tr.output);
         parts.push("");
       }
     }

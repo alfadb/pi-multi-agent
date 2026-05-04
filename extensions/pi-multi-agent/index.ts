@@ -24,9 +24,14 @@ import type {
   ResolvedModel,
   Strategy,
   Task,
-  TaskResult,
 } from "./types.js";
 import { loadConfig, DEFAULT_CONFIG } from "./config.js";
+
+/** Hard upper bound on tasks per dispatch. Each task is an independent LLM
+ *  call, so unbounded `tasks.length` becomes a rate-limit storm + cost
+ *  explosion vector if the model is prompt-injected. 16 is generous for any
+ *  reasonable parallel/ensemble use; debate/chain rarely needs > 5. */
+const MAX_TASKS_PER_DISPATCH = 16;
 import { executeParallel } from "./strategies/parallel.js";
 import { executeDebate } from "./strategies/debate.js";
 import { executeChain } from "./strategies/chain.js";
@@ -120,12 +125,12 @@ async function resolveModels(
     });
   };
 
-  for (const task of tasks) {
-    await resolveOne(task.id, task.model);
-  }
-  if (synthesisModel) {
-    await resolveOne("__synthesis__", synthesisModel);
-  }
+  // Resolve in parallel — each resolveOne does a registry lookup + auth call,
+  // and there's no inter-task dependency. Serial resolution wastes wall time
+  // proportional to the number of tasks (each auth call is ~ms-class).
+  const jobs: Promise<void>[] = tasks.map((t) => resolveOne(t.id, t.model));
+  if (synthesisModel) jobs.push(resolveOne("__synthesis__", synthesisModel));
+  await Promise.all(jobs);
 
   return resolved;
 }
@@ -258,7 +263,8 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       strategy: StrategySchema,
       tasks: Type.Array(TaskSchema, {
-        description: "Array of tasks to dispatch",
+        description: `Array of tasks to dispatch (max ${MAX_TASKS_PER_DISPATCH})`,
+        maxItems: MAX_TASKS_PER_DISPATCH,
       }),
       options: Type.Optional(DispatchOptionsSchema),
     }),
@@ -280,6 +286,19 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{ type: "text", text: "No tasks provided." }],
           details: { error: "empty tasks" },
+          isError: true,
+        };
+      }
+      // Defense-in-depth: schema maxItems should already reject this, but the
+      // schema layer is JSON-Schema-only and some providers may not enforce
+      // it. Belt-and-suspenders runtime check.
+      if (tasks.length > MAX_TASKS_PER_DISPATCH) {
+        return {
+          content: [{
+            type: "text",
+            text: `Too many tasks: ${tasks.length} (max ${MAX_TASKS_PER_DISPATCH}). Split into multiple dispatches if you genuinely need this many.`,
+          }],
+          details: { error: "too many tasks" },
           isError: true,
         };
       }
@@ -433,6 +452,9 @@ export default function (pi: ExtensionAPI) {
         // exclude it as a candidate so we always pick a *different* model.
         excludeMain: ctx.model,
         signal: _signal,
+        // Path-based image loads are confined to ctx.cwd — prevents an
+        // LLM-supplied path from exfiltrating files outside the project tree.
+        cwd: ctx.cwd,
       });
       if (r.ok === false) {
         return { content: [{ type: "text", text: r.error }], details: { error: r.error }, isError: true };

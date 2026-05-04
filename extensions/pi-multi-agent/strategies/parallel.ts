@@ -4,7 +4,7 @@
  */
 
 import type { DispatchOptions, ResolvedModel, Task, TaskResult } from "../types.js";
-import { runTask, type RunnerCtx } from "../runner.js";
+import { runTask, missingModelResult, type RunnerCtx } from "../runner.js";
 
 export async function executeParallel(
   tasks: Task[],
@@ -14,18 +14,8 @@ export async function executeParallel(
 ): Promise<TaskResult[]> {
   const jobs = tasks.map((task) => {
     const resolved = resolvedModels.get(task.id);
-    if (!resolved) {
-      return Promise.resolve<TaskResult>({
-        taskId: task.id,
-        model: task.model,
-        role: task.role,
-        output: "",
-        error: `Model not found: ${task.model}`,
-        durationMs: 0,
-      });
-    }
+    if (!resolved) return Promise.resolve(missingModelResult(task));
     return runTask(task, resolved, rctx);
   });
-
   return Promise.all(jobs);
 }

@@ -8,8 +8,22 @@
  * in-process pi-ai streamSimple call. Returns text + chosen model + usage.
  */
 
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { Model } from "@mariozechner/pi-ai";
+
+/** Default per-call timeout for vision LLM streams. Vision models can be slow
+ *  (multi-megapixel images, heavy reasoning); 2min is the historical default. */
+const DEFAULT_VISION_TIMEOUT_MS = 120_000;
+/** Vision calls are expensive; a single retry is enough — we don't want to
+ *  silently pay for repeated failures. */
+const DEFAULT_VISION_MAX_RETRIES = 1;
+/** Allowed image extensions for path-based loads. Prevents the LLM from
+ *  coercing vision into reading arbitrary text files (auth.json, /etc/passwd,
+ *  ~/.ssh/*) that might happen to be readable. Vision providers reject
+ *  non-image bytes anyway, but exfiltration via base64 round-trip to a
+ *  third-party model is a real risk we're closing. */
+const ALLOWED_IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".webp", ".gif"]);
 
 export interface VisionInput {
   imageBase64?: string;
@@ -33,6 +47,13 @@ export interface VisionDeps {
   signal?: AbortSignal;
   /** Per-call timeout in ms. Default 120_000. */
   timeoutMs?: number;
+  /**
+   * Project cwd. Path-based image loads MUST resolve under this root — prevents
+   * an LLM-controlled path from reaching arbitrary files. When undefined,
+   * absolute paths and `..` traversals are still rejected; only relative paths
+   * resolved against process.cwd() are allowed.
+   */
+  cwd?: string;
 }
 
 export interface VisionOk {
@@ -50,20 +71,59 @@ export type VisionResult = VisionOk | VisionErr;
 
 type ResolvedImage = { base64: string; mimeType: string };
 
+/** Validate that `userPath` is safe to read: must have an image extension,
+ *  must resolve under `cwd` (or process.cwd() if cwd undefined). Returns the
+ *  absolute path on success, or a VisionErr.
+ *
+ *  Threat model: the LLM populates input.path. Without these checks a
+ *  prompt-injected subagent (or a confused-deputy main agent) could request
+ *  vision on /etc/passwd, ~/.ssh/id_rsa, .pi/auth.json — we'd base64-encode
+ *  those bytes and ship them to a third-party vision provider, leaking
+ *  secrets. Two layers of defense:
+ *    1. Extension allowlist — non-image bytes have no business being read.
+ *    2. Path containment — even valid PNGs outside cwd shouldn't be readable
+ *       (a subagent shouldn't roam beyond the project tree).
+ */
+function validateImagePath(userPath: string, cwd: string | undefined): { ok: true; abs: string; ext: string } | VisionErr {
+  const ext = path.extname(userPath).toLowerCase();
+  if (!ALLOWED_IMAGE_EXTS.has(ext)) {
+    return {
+      ok: false,
+      error: `Image path extension '${ext || "(none)"}' not allowed. Permitted: ${[...ALLOWED_IMAGE_EXTS].join(", ")}`,
+    };
+  }
+  const root = path.resolve(cwd ?? process.cwd());
+  const abs = path.resolve(root, userPath);
+  // Trailing-separator guard: ensure /a/bc isn't treated as inside /a/b.
+  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
+  if (abs !== root && !abs.startsWith(rootWithSep)) {
+    return {
+      ok: false,
+      error: `Image path '${userPath}' resolves outside the project root.`,
+    };
+  }
+  return { ok: true, abs, ext };
+}
+
 /** Resolve image bytes from base64 or path; infer mime when path provided.
+ *  Uses async fs to avoid blocking the event loop on disk read.
  *  Returns either ResolvedImage or a VisionErr (so callers can early-return). */
-function resolveImage(input: VisionInput): ResolvedImage | VisionErr {
+async function resolveImage(
+  input: VisionInput,
+  cwd: string | undefined,
+): Promise<ResolvedImage | VisionErr> {
   let imageBase64 = input.imageBase64;
   let mimeType = input.mimeType || "image/png";
   if (input.path && !imageBase64) {
+    const v = validateImagePath(input.path, cwd);
+    if (v.ok === false) return v;
     try {
-      const buf = fs.readFileSync(input.path);
+      const buf = await fs.readFile(v.abs);
       imageBase64 = buf.toString("base64");
-      const ext = input.path.split(".").pop()?.toLowerCase();
-      if (ext === "jpg" || ext === "jpeg") mimeType = "image/jpeg";
-      else if (ext === "png") mimeType = "image/png";
-      else if (ext === "webp") mimeType = "image/webp";
-      else if (ext === "gif") mimeType = "image/gif";
+      if (v.ext === ".jpg" || v.ext === ".jpeg") mimeType = "image/jpeg";
+      else if (v.ext === ".png") mimeType = "image/png";
+      else if (v.ext === ".webp") mimeType = "image/webp";
+      else if (v.ext === ".gif") mimeType = "image/gif";
     } catch (e: any) {
       return { ok: false, error: `Failed to read image: ${e.message ?? String(e)}` };
     }
@@ -88,7 +148,7 @@ function scoreByPrefs(m: any, prefs: string[]): number {
 }
 
 export async function analyzeImage(input: VisionInput, deps: VisionDeps): Promise<VisionResult> {
-  const img = resolveImage(input);
+  const img = await resolveImage(input, deps.cwd);
   if ("ok" in img && img.ok === false) return img;
   const resolved = img as ResolvedImage;
 
@@ -107,6 +167,18 @@ export async function analyzeImage(input: VisionInput, deps: VisionDeps): Promis
     .map((x: any) => x.m);
 
   if (candidates.length === 0) {
+    // The excluded main model itself supports images. Calling vision when
+    // the caller already has image input would be a no-op round-trip; surface
+    // a clear actionable message instead of a misleading "none available".
+    if (deps.excludeMain && (deps.excludeMain as any).input?.includes?.("image")) {
+      return {
+        ok: false,
+        error:
+          `Caller's own model (${deps.excludeMain.provider}/${deps.excludeMain.id}) ` +
+          "supports image input — pass the image directly in your prompt instead of " +
+          "calling vision. (vision tool exists to delegate to a *different* model.)",
+      };
+    }
     return {
       ok: false,
       error:
@@ -138,8 +210,8 @@ export async function analyzeImage(input: VisionInput, deps: VisionDeps): Promis
         apiKey: auth.apiKey,
         headers: auth.headers,
         signal: deps.signal,
-        timeoutMs: deps.timeoutMs ?? 120_000,
-        maxRetries: 1,
+        timeoutMs: deps.timeoutMs ?? DEFAULT_VISION_TIMEOUT_MS,
+        maxRetries: DEFAULT_VISION_MAX_RETRIES,
       },
     );
     const finalMsg = await stream.result();

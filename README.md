@@ -65,14 +65,24 @@ multi_dispatch(strategy, tasks[], options?)
 
 子代理工具受限以保证安全和可预测：
 
-| 类别 | 名称 |
-|---|---|
-| SDK 内置 | `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls` |
-| 别名 | `readonly` (= read+grep+find+ls)，`coding` (= read+bash+edit+write+grep+find+ls) |
-| Multi-agent 自家 | `vision`, `imagine` |
-| **拒绝** | `multi_dispatch`（递归危险），第三方扩展工具（无安全的 ExtensionContext 转发） |
+| 类别 | 名称 | 默认 |
+|---|---|---|
+| 只读 SDK 内置 | `read`, `grep`, `find`, `ls` | ✅ 允许 |
+| **变更** SDK 内置 | `bash`, `edit`, `write` | ❌ **默认拒绝**，需 `PI_MULTI_AGENT_ALLOW_MUTATING=1` 才允许 |
+| 别名 | `readonly` (= read+grep+find+ls) | ✅ |
+| Multi-agent 自家 | `vision`, `imagine` | ✅ |
+| **拒绝** | `multi_dispatch`（递归危险），第三方扩展工具（无安全的 ExtensionContext 转发） | — |
 
 省略 `tools` 字段 = 纯推理任务（无工具）。
+
+##### 为什么 `bash`/`edit`/`write` 默认禁用？
+
+子代理没有用户确认流程。如果子代理模型被 prompt 注入（如读到含恶意指令的文件内容），会产生两个真实风险：
+
+1. **RCE in cwd**—`bash` 在父项目根目录运行任意命令
+2. **API key 泄露**—`bash` 继承父进程 env（`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`...）并可 `curl` 到任意外部
+
+只有在你完全信任子代理 prompt 来源时（例如全是你手写的 prompt，所有输入都可预期）才应该开。
 
 ### options
 
@@ -118,7 +128,12 @@ multi_dispatch(
 )
 ```
 
-### 接力编码（带写权限）
+### 接力编码（带写权限 — 需环境变量 opt-in）
+
+```bash
+# 运行前需设置：
+export PI_MULTI_AGENT_ALLOW_MUTATING=1
+```
 
 ```
 multi_dispatch(
@@ -126,11 +141,11 @@ multi_dispatch(
   tasks=[
     {id:"impl", model:"openai/gpt-5.5", thinking:"xhigh",
      prompt:"在 src/auth.ts 中实现 JWT 鉴权中间件",
-     tools:"coding"},
+     tools:"read,edit,write"},
     {id:"review", model:"anthropic/claude-sonnet-4", thinking:"xhigh",
      prompt:"审查上述实现的安全漏洞", tools:"readonly"},
     {id:"fix", model:"openai/gpt-5.5", thinking:"xhigh",
-     prompt:"根据审查意见修复安全问题", tools:"coding"},
+     prompt:"根据审查意见修复安全问题", tools:"read,edit,write"},
   ]
 )
 ```
@@ -196,7 +211,13 @@ multi_dispatch(
 - **自动化优先**：子代理并行调度全自动，结果自动返回主会话
 - **模型自由**：每个子代理独立指定模型和推理强度，充分发挥不同模型的互补优势
 - **进程内执行**：SDK-only — 不再 spawn 子进程，杜绝孤儿和 cwd 污染
-- **安全的工具委派**：白名单制，子代理拿不到任意第三方扩展工具，也不能递归调用 `multi_dispatch`
+- **安全的工具委派**：白名单制；子代理拿不到任意第三方扩展工具，不能递归调用 `multi_dispatch`，写/执行类工具默认禁用
+
+## 限制
+
+- `tasks.length` 上限 16（防止 prompt 注入导致 cost 爆炸 / rate-limit storm）
+- 每任务 tool-calling 循环上限 50 轮（防止 runaway loop 烧光 timeout 预算）
+- vision 工具的 `path` 参数限定在 `cwd` 内，且只接受图片扩展名（`.png/.jpg/.jpeg/.webp/.gif`）
 
 ## License
 

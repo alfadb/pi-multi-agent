@@ -3,18 +3,38 @@
  *
  * Replaces the old print/rpc subprocess backends. Every task = one in-process
  * `completeSimple` call, optionally wrapped in a tool-calling loop when the
- * task requested tools. Bounded by:
- *   - per-task timeout (linked to parent abort signal so ESC wins instantly)
- *   - parent ctx.signal propagating from the host pi
- *
- * No turn cap on the tool loop. The model decides when it's done by emitting
- * stopReason="stop"; a runaway loop is bounded by the timeout above.
+ * task requested tools. Bounded by THREE independent limits:
+ *   1. per-task timeout (linked to parent abort signal so ESC wins instantly)
+ *   2. parent ctx.signal propagating from the host pi
+ *   3. MAX_TOOL_TURNS hard cap on the tool-calling loop — protects against
+ *      prompt-injected files looping the model through unbounded tool calls
+ *      to burn the timeout budget on tokens. 50 turns is generous for legit
+ *      multi-step research while still stopping pathological cases fast.
  */
 
 import { completeSimple } from "@mariozechner/pi-ai";
 import type { AssistantMessage, Context, Message, ToolCall } from "@mariozechner/pi-ai";
 import type { ResolvedModel, Task, TaskResult } from "./types.js";
 import { buildSubagentTools, rejectionMessage } from "./subagent-tools.js";
+
+/** Maximum tool-calling iterations before forced termination. Real research
+ *  tasks rarely exceed 10-20 turns; 50 is a generous safety cap. */
+const MAX_TOOL_TURNS = 50;
+
+/** Standard "model not resolvable" TaskResult — used by every strategy when
+ *  resolveModels couldn't produce a ResolvedModel for a task (invalid ref,
+ *  unknown provider, or auth fail). Centralized so error shape is consistent
+ *  across parallel/debate/chain/ensemble. */
+export function missingModelResult(task: Task): TaskResult {
+  return {
+    taskId: task.id,
+    model: task.model,
+    role: task.role,
+    output: "",
+    error: `Model not found: ${task.model}`,
+    durationMs: 0,
+  };
+}
 
 export interface RunnerCtx {
   /** Project cwd — passed to subagent tools (read/edit/etc. and imagine output dir). */
@@ -59,10 +79,21 @@ export async function runTask(
   const modelId = `${resolved.provider}/${resolved.modelId}`;
 
   // Per-task abort: linked to parent signal so ESC propagates immediately.
+  // CRITICAL: if parent signal is *already* aborted before runTask is called
+  // (e.g. caller pre-cancelled, or this is a follow-up task in a sequential
+  // strategy where ESC fired during a prior task), the addEventListener path
+  // never fires — abort events don't replay. Without this sync check, the task
+  // would proceed to call completeSimple and run to its own timeout (verified:
+  // 57s wall on a pre-aborted signal). Sync-propagate first.
   const ac = new AbortController();
+  if (rctx.signal?.aborted) ac.abort();
   const onParentAbort = () => ac.abort();
   rctx.signal?.addEventListener("abort", onParentAbort, { once: true });
   const timer = setTimeout(() => ac.abort(), rctx.taskTimeoutMs);
+  // Don't keep the event loop alive solely for this timer; abort behavior is
+  // unchanged because completeSimple's pending fetch keeps the loop alive
+  // until the request settles, and ac.signal works either way.
+  timer.unref?.();
 
   try {
     // Validate + build tools first; reject with structured error before LLM call.
@@ -92,9 +123,22 @@ export async function runTask(
     ];
 
     let lastUsage: TaskResult["usage"];
+    let turn = 0;
 
     // Tool-calling loop. Single-shot tasks (no tools) terminate after iter 1.
     while (true) {
+      turn += 1;
+      if (turn > MAX_TOOL_TURNS) {
+        return {
+          taskId: task.id,
+          model: modelId,
+          role: task.role,
+          output: "",
+          error: `Tool-calling loop exceeded MAX_TOOL_TURNS=${MAX_TOOL_TURNS}. The model kept emitting tool calls without converging on a final answer; possible prompt injection or runaway loop.`,
+          durationMs: Date.now() - start,
+          usage: lastUsage,
+        };
+      }
       const ctx: Context = {
         systemPrompt: "",
         messages,
