@@ -1,56 +1,50 @@
 /**
  * Ensemble strategy — all models answer the same question independently,
  * then a synthesis model picks the best answer or builds consensus.
- * Good for critical decisions where you want multiple independent takes.
+ * SDK-only: tasks dispatch in parallel via runTask, then a synthesis task runs.
  */
 
-import type {
-  Task,
-  TaskResult,
-  DispatchOptions,
-  ResolvedModel,
-} from "../types.js";
-import { executePrint } from "../backends/print.js";
-import { executeRpc } from "../backends/rpc.js";
+import type { DispatchOptions, ResolvedModel, Task, TaskResult } from "../types.js";
+import { runTask, type RunnerCtx } from "../runner.js";
 
 export async function executeEnsemble(
   tasks: Task[],
   resolvedModels: Map<string, ResolvedModel>,
-  opts: DispatchOptions & { timeoutMs: number; extraFlags: string[] },
+  rctx: RunnerCtx,
+  opts: DispatchOptions,
 ): Promise<{ taskResults: TaskResult[]; synthesis: string }> {
-  const mode = opts.executionMode ?? "print";
-  const executor = mode === "rpc" ? executeRpc : executePrint;
-
-  // All models answer the same prompt independently
+  // All models answer the same prompt independently (Promise.all).
   const jobs = tasks.map((task) => {
     const resolved = resolvedModels.get(task.id);
     if (!resolved) {
-      return Promise.resolve({
+      return Promise.resolve<TaskResult>({
         taskId: task.id,
         model: task.model,
         role: task.role,
         output: "",
         error: `Model not found: ${task.model}`,
         durationMs: 0,
-      } satisfies TaskResult);
+      });
     }
-    return executor(task, resolved, {
-      taskTimeoutMs: opts.timeoutMs,
-      extraFlags: opts.extraFlags,
-    });
+    return runTask(task, resolved, rctx);
   });
 
   const taskResults = await Promise.all(jobs);
 
-  // Synthesis: pick best or build consensus
+  // Synthesis pass — pick best or build consensus.
   const synthesisModel = opts.synthesisModel ?? tasks[0].model;
-  const synthesisResolved = resolvedModels.get("__synthesis__")
-    ?? resolvedModels.get(tasks[0].id);
-  if (!synthesisResolved) throw new Error("No model for synthesis");
+  const synthesisResolved =
+    resolvedModels.get("__synthesis__") ?? resolvedModels.get(tasks[0].id);
+  if (!synthesisResolved) {
+    return { taskResults, synthesis: "Synthesis failed: no model resolvable" };
+  }
 
   const responses = taskResults
     .filter((r) => !r.error)
-    .map((r, i) => `### Response ${i + 1}: ${r.role ?? r.taskId} (${r.model})\n\n${r.output}`)
+    .map(
+      (r, i) =>
+        `### Response ${i + 1}: ${r.role ?? r.taskId} (${r.model})\n\n${r.output}`,
+    )
     .join("\n\n---\n\n");
 
   const synthesisPrompt = [
@@ -78,10 +72,7 @@ export async function executeEnsemble(
     prompt: synthesisPrompt,
   };
 
-  const synthesisResult = await executor(synthesisTask, synthesisResolved, {
-    taskTimeoutMs: opts.timeoutMs,
-    extraFlags: opts.extraFlags,
-  });
+  const synthesisResult = await runTask(synthesisTask, synthesisResolved, rctx);
 
   return {
     taskResults,

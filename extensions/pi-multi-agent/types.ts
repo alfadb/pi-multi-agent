@@ -1,6 +1,11 @@
 /**
- * pi-multi-agent types — shared across strategies and backends.
+ * pi-multi-agent types — shared across strategies and the SDK runner.
+ *
+ * SDK-only architecture: every task = one in-process LLM call (with optional
+ * tool-calling loop). No subprocess, no execution-mode switching.
  */
+
+import type { Model } from "@mariozechner/pi-ai";
 
 /** A single task dispatched to one model. */
 export interface Task {
@@ -14,15 +19,25 @@ export interface Task {
   prompt: string;
   /** Optional role label (shown in status/logs). */
   role?: string;
-  /** Optional tools allowlist (comma-separated). Omit for full tool access. */
+  /**
+   * Optional comma-separated tool allowlist.
+   *
+   * Accepted entries:
+   *   - SDK built-ins: read, bash, edit, write, grep, find, ls
+   *   - Aliases: "readonly" (=read,grep,find,ls), "coding" (=read,bash,edit,write,grep,find,ls)
+   *   - Multi-agent self-delegatable tools: vision, imagine
+   *
+   * Anything else (including multi_dispatch and third-party extension tools)
+   * is rejected with an error in the task's result. Subagents cannot trigger
+   * nested dispatches or carry the host's ExtensionContext.
+   *
+   * Omit for a pure-reasoning task (no tools).
+   */
   tools?: string;
 }
 
 /** Strategy determines how tasks are executed and combined. */
 export type Strategy = "parallel" | "debate" | "chain" | "ensemble";
-
-/** Backend determines the execution mechanism. */
-export type ExecutionMode = "print" | "rpc" | "sdk";
 
 /** Options controlling the overall dispatch. */
 export interface DispatchOptions {
@@ -32,8 +47,6 @@ export interface DispatchOptions {
   synthesisModel?: string;
   /** Synthesis thinking level. Default: "high". */
   synthesisThinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-  /** Override the auto-selected execution mode. */
-  executionMode?: ExecutionMode;
   /** Timeout per task in milliseconds. Default 300_000. */
   taskTimeoutMs?: number;
 }
@@ -59,7 +72,6 @@ export interface TaskResult {
 /** Full dispatch result returned to the LLM. */
 export interface DispatchResult {
   strategy: Strategy;
-  executionMode: ExecutionMode;
   tasks: TaskResult[];
   /** Synthesis output (debate/ensemble strategies). */
   synthesis?: string;
@@ -69,10 +81,12 @@ export interface DispatchResult {
   error?: string;
 }
 
-/** Resolved model info from the registry. */
+/** Resolved model info from the registry, ready for completeSimple. */
 export interface ResolvedModel {
   provider: string;
   modelId: string;
+  /** Concrete Model<Api> object for completeSimple. */
+  model: Model<any>;
   apiKey: string;
   headers: Record<string, string>;
   baseUrl?: string;

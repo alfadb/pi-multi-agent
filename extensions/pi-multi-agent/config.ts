@@ -1,45 +1,38 @@
 /**
- * pi-multi-agent config — default strategy→mode mapping and timeouts.
- * Can be overridden via .pi-multi-agent/config.json in the project.
+ * pi-multi-agent config — defaults + project-local overrides.
+ *
+ * SDK-only architecture: there is no "execution mode" knob anymore — every
+ * dispatch runs in-process via completeSimple. The previous strategyModes /
+ * extraPiFlags fields have been removed; loading legacy config files just
+ * ignores those keys (no-op), so older .pi-multi-agent/config.json files
+ * remain valid for the fields we still honor below.
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExecutionMode, Strategy } from "./types.js";
 
 export interface MultiAgentConfig {
-  /** Default execution mode per strategy. */
-  strategyModes: Record<Strategy, ExecutionMode>;
   /** Default task timeout in ms. */
   taskTimeoutMs: number;
   /** Default debate rounds. */
   debateRounds: number;
   /** Default synthesis thinking level. */
   synthesisThinking: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-  /** Extra CLI flags passed to pi subprocesses. */
-  extraPiFlags: string[];
   /**
    * Vision tool: ordered preference list, most-preferred first.
    * Each entry is "provider/idSubstring" — substring match on model id (case-insensitive),
    * tolerant of version suffixes (e.g. "openai/gpt-5.5-pro" matches "gpt-5.5-pro-2026-07-15").
    * Models matching earlier entries win. Unmatched models still participate, ordered by
    * cost.input descending as a rough capability proxy.
-   * The current main model is always excluded (if it supported images, vision wouldn't be called).
+   * The current main model is excluded by the vision tool itself.
    */
   visionModelPreferences: string[];
 }
 
 export const DEFAULT_CONFIG: MultiAgentConfig = {
-  strategyModes: {
-    parallel: "print",
-    debate: "rpc",
-    chain: "rpc",
-    ensemble: "print",
-  },
   taskTimeoutMs: 300_000,
   debateRounds: 2,
   synthesisThinking: "high",
-  extraPiFlags: [],
   visionModelPreferences: [
     "openai/gpt-5.5-pro",
     "openai/gpt-5.5",
@@ -62,10 +55,6 @@ export function loadConfig(projectRoot: string): MultiAgentConfig {
   );
 
   return {
-    strategyModes: {
-      ...DEFAULT_CONFIG.strategyModes,
-      ...((projectConfig.strategyModes as Record<string, ExecutionMode>) ?? {}),
-    },
     taskTimeoutMs:
       (projectConfig.taskTimeoutMs as number) ?? DEFAULT_CONFIG.taskTimeoutMs,
     debateRounds:
@@ -73,8 +62,6 @@ export function loadConfig(projectRoot: string): MultiAgentConfig {
     synthesisThinking:
       (projectConfig.synthesisThinking as typeof DEFAULT_CONFIG.synthesisThinking) ??
       DEFAULT_CONFIG.synthesisThinking,
-    extraPiFlags:
-      (projectConfig.extraPiFlags as string[]) ?? DEFAULT_CONFIG.extraPiFlags,
     visionModelPreferences:
       (projectConfig.visionModelPreferences as string[]) ??
       DEFAULT_CONFIG.visionModelPreferences,

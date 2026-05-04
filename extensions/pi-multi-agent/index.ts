@@ -1,31 +1,39 @@
 /**
- * pi-multi-agent — Multi-model parallel agent dispatch for pi coding agent.
+ * pi-multi-agent — multi-model parallel agent dispatch for the pi coding agent.
  *
- * Registers the `multi_dispatch` tool, enabling the LLM to spawn parallel,
- * debate, chain, or ensemble sub-agent tasks across different models and backends.
+ * Registers three tools:
+ *   - multi_dispatch: spawn parallel/debate/chain/ensemble subagents (SDK-only)
+ *   - vision:        delegate image analysis to the best vision-capable model
+ *   - imagine:       generate an image via OpenAI gpt-image-2 / dall-e
  *
- * Usage in skills/prompts:
- *   multi_dispatch(strategy="parallel", tasks=[...], options={...})
+ * Architecture: SDK-only. Every subagent task is one in-process completeSimple
+ * call (with optional tool-calling loop). No subprocess, no cwd pollution, no
+ * orphan processes; ESC propagates through ctx.signal end-to-end.
+ *
+ * Subagents may delegate to vision/imagine via Task.tools (those run as
+ * AgentTool instances built on the same core functions used here). They cannot
+ * delegate to multi_dispatch itself (no nested dispatch) or to arbitrary
+ * third-party extension tools (no ExtensionContext forwarding).
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
 import type {
-  Task,
-  Strategy,
   DispatchOptions,
   DispatchResult,
   ResolvedModel,
+  Strategy,
+  Task,
+  TaskResult,
 } from "./types.js";
 import { loadConfig, DEFAULT_CONFIG } from "./config.js";
 import { executeParallel } from "./strategies/parallel.js";
 import { executeDebate } from "./strategies/debate.js";
 import { executeChain } from "./strategies/chain.js";
 import { executeEnsemble } from "./strategies/ensemble.js";
-import { cleanupRpcSessions } from "./backends/rpc.js";
+import type { RunnerCtx } from "./runner.js";
+import { analyzeImage } from "./tools/vision-core.js";
+import { generateImage } from "./tools/imagine-core.js";
 
 // ── Tool schema ──────────────────────────────────────────────────
 
@@ -38,7 +46,12 @@ const TaskSchema = Type.Object({
   prompt: Type.String({ description: "Prompt sent to this task" }),
   role: Type.Optional(Type.String({ description: "Human-readable role label" })),
   tools: Type.Optional(
-    Type.String({ description: "Comma-separated tool allowlist" }),
+    Type.String({
+      description:
+        "Comma-separated tool allowlist. Built-ins: read, bash, edit, write, grep, find, ls. " +
+        'Aliases: "readonly" (=read,grep,find,ls), "coding" (=read+bash+edit+write+grep+find+ls). ' +
+        "Multi-agent: vision, imagine. Anything else (incl. multi_dispatch) is rejected.",
+    }),
   ),
 });
 
@@ -56,9 +69,6 @@ const DispatchOptionsSchema = Type.Object({
   synthesisThinking: Type.Optional(
     Type.String({ description: "Thinking level for synthesis" }),
   ),
-  executionMode: Type.Optional(
-    Type.String({ description: "Override execution mode: print, rpc, sdk" }),
-  ),
   taskTimeoutMs: Type.Optional(
     Type.Number({ description: "Per-task timeout in ms (default 300000)" }),
   ),
@@ -66,40 +76,55 @@ const DispatchOptionsSchema = Type.Object({
 
 // ── Model resolution ─────────────────────────────────────────────
 
+/**
+ * Resolve every task's "provider/modelId" string into a ResolvedModel
+ * (concrete Model<Api> object + apiKey + headers). Tasks whose model can't
+ * be resolved are simply omitted from the map; runTask reports them as
+ * "Model not found" errors.
+ *
+ * Also resolves the synthesis model (if specified separately), keyed under
+ * "__synthesis__" so debate/ensemble can pick it up.
+ */
 async function resolveModels(
   tasks: Task[],
   registry: any,
+  synthesisModel?: string,
 ): Promise<Map<string, ResolvedModel>> {
   const resolved = new Map<string, ResolvedModel>();
 
-  for (const task of tasks) {
-    const [provider, modelId] = task.model.split("/");
+  const resolveOne = async (id: string, modelStr: string) => {
+    const [provider, modelId] = modelStr.split("/");
     if (!provider || !modelId) {
-      console.error(`[pi-multi-agent] Invalid model ref: ${task.model}`);
-      continue;
+      console.error(`[pi-multi-agent] Invalid model ref: ${modelStr}`);
+      return;
     }
-
     const model = registry.find(provider, modelId);
     if (!model) {
-      console.error(`[pi-multi-agent] Model not found: ${task.model}`);
-      continue;
+      console.error(`[pi-multi-agent] Model not found: ${modelStr}`);
+      return;
     }
-
     const auth = await registry.getApiKeyAndHeaders(model);
     if (!auth.ok || !auth.apiKey) {
       console.error(
-        `[pi-multi-agent] Auth failed for ${task.model}: ${auth.error ?? "no key"}`,
+        `[pi-multi-agent] Auth failed for ${modelStr}: ${auth.error ?? "no key"}`,
       );
-      continue;
+      return;
     }
-
-    resolved.set(task.id, {
+    resolved.set(id, {
       provider,
       modelId,
+      model,
       apiKey: auth.apiKey,
       headers: auth.headers ?? {},
       baseUrl: model.baseUrl,
     });
+  };
+
+  for (const task of tasks) {
+    await resolveOne(task.id, task.model);
+  }
+  if (synthesisModel) {
+    await resolveOne("__synthesis__", synthesisModel);
   }
 
   return resolved;
@@ -112,49 +137,49 @@ async function dispatch(
   tasks: Task[],
   opts: DispatchOptions,
   resolvedModels: Map<string, ResolvedModel>,
-  extraFlags: string[],
+  rctx: RunnerCtx,
 ): Promise<DispatchResult> {
-  const timeoutMs = opts.taskTimeoutMs ?? DEFAULT_CONFIG.taskTimeoutMs;
-  const config = { ...opts, timeoutMs, extraFlags };
-
   const start = Date.now();
-
-  // Validate tasks
   if (tasks.length === 0) {
-    return { strategy, executionMode: "print", tasks: [], error: "No tasks provided", totalDurationMs: 0 };
+    return { strategy, tasks: [], error: "No tasks provided", totalDurationMs: 0 };
   }
-
-  // Validate and resolve execution mode
-  const VALID_MODES = ["print", "rpc"];
-  let effectiveMode = opts.executionMode ?? DEFAULT_CONFIG.strategyModes[strategy];
-  if (!VALID_MODES.includes(effectiveMode)) {
-    effectiveMode = DEFAULT_CONFIG.strategyModes[strategy];
-  }
-  const dispatchOpts = { ...config, executionMode: effectiveMode };
-
   try {
     switch (strategy) {
       case "parallel": {
-        const taskResults = await executeParallel(tasks, resolvedModels, dispatchOpts);
-        return { strategy, executionMode: effectiveMode, tasks: taskResults, totalDurationMs: Date.now() - start };
+        const t = await executeParallel(tasks, resolvedModels, rctx, opts);
+        return { strategy, tasks: t, totalDurationMs: Date.now() - start };
       }
       case "debate": {
-        const { taskResults, synthesis } = await executeDebate(tasks, resolvedModels, dispatchOpts);
-        return { strategy, executionMode: effectiveMode, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
+        const { taskResults, synthesis } = await executeDebate(
+          tasks, resolvedModels, rctx, opts,
+        );
+        return { strategy, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
       }
       case "chain": {
-        const taskResults = await executeChain(tasks, resolvedModels, dispatchOpts);
-        return { strategy, executionMode: effectiveMode, tasks: taskResults, totalDurationMs: Date.now() - start };
+        const t = await executeChain(tasks, resolvedModels, rctx, opts);
+        return { strategy, tasks: t, totalDurationMs: Date.now() - start };
       }
       case "ensemble": {
-        const { taskResults, synthesis } = await executeEnsemble(tasks, resolvedModels, dispatchOpts);
-        return { strategy, executionMode: effectiveMode, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
+        const { taskResults, synthesis } = await executeEnsemble(
+          tasks, resolvedModels, rctx, opts,
+        );
+        return { strategy, tasks: taskResults, synthesis, totalDurationMs: Date.now() - start };
       }
       default:
-        return { strategy, executionMode: "print", tasks: [], error: `Unknown strategy: ${strategy}`, totalDurationMs: 0 };
+        return {
+          strategy,
+          tasks: [],
+          error: `Unknown strategy: ${strategy}`,
+          totalDurationMs: 0,
+        };
     }
   } catch (e: any) {
-    return { strategy, executionMode: effectiveMode, tasks: [], error: `Dispatch failed: ${e?.message ?? String(e)}`, totalDurationMs: Date.now() - start };
+    return {
+      strategy,
+      tasks: [],
+      error: `Dispatch failed: ${e?.message ?? String(e)}`,
+      totalDurationMs: Date.now() - start,
+    };
   }
 }
 
@@ -163,7 +188,7 @@ async function dispatch(
 function formatResult(result: DispatchResult): string {
   const lines: string[] = [
     `# Multi-Agent Dispatch Result`,
-    `Strategy: ${result.strategy} | Mode: ${result.executionMode} | Duration: ${(result.totalDurationMs / 1000).toFixed(1)}s`,
+    `Strategy: ${result.strategy} | Duration: ${(result.totalDurationMs / 1000).toFixed(1)}s`,
     "",
   ];
 
@@ -183,7 +208,6 @@ function formatResult(result: DispatchResult): string {
     if (task.error) {
       lines.push(`**Error:** ${task.error}`);
     } else {
-      // Truncate very long outputs for the LLM context
       const output = task.output.length > 8000
         ? task.output.slice(0, 8000) + "\n\n[...truncated...]"
         : task.output;
@@ -205,11 +229,6 @@ function formatResult(result: DispatchResult): string {
 // ── Extension entry ──────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  // Cleanup RPC sessions on shutdown
-  pi.on("session_shutdown", () => {
-    cleanupRpcSessions();
-  });
-
   // Persistent status bar icon
   pi.on("session_start", async (_event, ctx) => {
     if (ctx.hasUI) {
@@ -223,15 +242,17 @@ export default function (pi: ExtensionAPI) {
     description:
       "Execute multiple AI tasks in parallel, debate, chain, or ensemble mode. " +
       "Each task can use a different model and thinking level. " +
-      "Backends: print (headless), rpc (multi-turn). " +
+      "All tasks run in-process (SDK-only) — no subprocess, no orphan risk. " +
+      "Subagents may use SDK built-in tools or vision/imagine via the `tools` field. " +
       "Use for: parallel code review, multi-expert design debate, chain coding, ensemble decision-making.",
     promptSnippet:
-      "multi_dispatch(strategy, tasks[], options?) — spawn parallel sub-agents with different models",
+      "multi_dispatch(strategy, tasks[], options?) — spawn in-process sub-agents with different models",
     promptGuidelines: [
       "Use multi_dispatch for tasks that benefit from multiple models/perspectives: code review, design discussion, critical decisions.",
       "Choose strategy: parallel for independent analysis, debate for collaborative discussion, chain for sequential refinement, ensemble for independent votes + synthesis.",
       "Assign different models per task based on strengths: Claude for security, GPT for architecture, DeepSeek for performance.",
       "Set thinking level per task: xhigh for critical analysis, off for simple lookups.",
+      "Subagent tool access: omit `tools` for pure reasoning. Use 'readonly' (read,grep,find,ls) for code review. Use 'coding' for tasks that must edit files. Add 'vision' or 'imagine' explicitly when needed.",
       "The tool runs asynchronously and returns merged results. Check task error fields for failures.",
     ],
     parameters: Type.Object({
@@ -245,37 +266,34 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const { strategy, tasks, options } = params;
 
-      // Validate
       if (!["parallel", "debate", "chain", "ensemble"].includes(strategy)) {
         return {
-          content: [
-            {
-              type: "text",
-              text: `Invalid strategy: ${strategy}. Use: parallel, debate, chain, ensemble.`,
-            },
-          ],
+          content: [{
+            type: "text",
+            text: `Invalid strategy: ${strategy}. Use: parallel, debate, chain, ensemble.`,
+          }],
+          details: { error: `invalid strategy: ${strategy}` },
           isError: true,
         };
       }
-
       if (!tasks || tasks.length === 0) {
         return {
           content: [{ type: "text", text: "No tasks provided." }],
+          details: { error: "empty tasks" },
           isError: true,
         };
       }
 
-      // Load config
       const config = loadConfig(ctx.cwd);
       const opts: DispatchOptions = {
         debateRounds: options?.debateRounds ?? config.debateRounds,
         synthesisModel: options?.synthesisModel,
-        synthesisThinking: (options?.synthesisThinking as DispatchOptions["synthesisThinking"]) ?? config.synthesisThinking,
-        executionMode: (options?.executionMode as DispatchOptions["executionMode"]) ?? config.strategyModes[strategy as Strategy],
+        synthesisThinking:
+          (options?.synthesisThinking as DispatchOptions["synthesisThinking"]) ??
+          config.synthesisThinking,
         taskTimeoutMs: options?.taskTimeoutMs ?? config.taskTimeoutMs,
       };
 
-      // Update status
       if (ctx.hasUI) {
         try {
           ctx.ui.setStatus(
@@ -285,19 +303,32 @@ export default function (pi: ExtensionAPI) {
         } catch {}
       }
 
-      // Resolve models
-      const resolvedModels = await resolveModels(tasks, ctx.modelRegistry);
+      // typebox emits `thinking: string` from the Type.String schema; the
+      // ThinkingLevel union is enforced at runtime by pi-ai, so cast here.
+      const typedTasks = tasks as Task[];
 
-      // Dispatch
-      const result = await dispatch(
-        strategy as Strategy,
-        tasks,
-        opts,
-        resolvedModels,
-        config.extraPiFlags,
+      const resolvedModels = await resolveModels(
+        typedTasks,
+        ctx.modelRegistry,
+        opts.synthesisModel,
       );
 
-      // Update status
+      const rctx: RunnerCtx = {
+        cwd: ctx.cwd,
+        modelRegistry: ctx.modelRegistry,
+        visionPrefs: config.visionModelPreferences,
+        taskTimeoutMs: opts.taskTimeoutMs ?? DEFAULT_CONFIG.taskTimeoutMs,
+        signal: _signal,
+      };
+
+      const result = await dispatch(
+        strategy as Strategy,
+        typedTasks,
+        opts,
+        resolvedModels,
+        rctx,
+      );
+
       if (ctx.hasUI) {
         try {
           const ok = result.tasks.filter((t) => !t.error).length;
@@ -317,7 +348,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── imagine — AI image generation via DALL-E ─────────────────
+  // ── imagine — AI image generation via DALL-E / gpt-image-2 ───
 
   pi.registerTool({
     name: "imagine",
@@ -341,91 +372,33 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      try {
-        // Use sub2api Responses endpoint (Images API is broken on this proxy)
-        const apiKey = process.env.SUB2API_API_KEY_OPENAI || process.env.OPENAI_API_KEY;
-        if (!apiKey) {
-          return { content: [{ type: "text", text: "No OpenAI API key found. Set OPENAI_API_KEY or SUB2API_API_KEY_OPENAI." }], isError: true };
-        }
-
-        // Build request body. The Responses endpoint takes size/quality at the top level
-        // for image_generation_call. Verified 2026-05-03 against sub2api/v1/responses:
-        //   - size is honored (1024x1024 / 1792x1024 / 1024x1792)
-        //   - quality field is currently coerced to "low" by the sub2api proxy regardless
-        //     of the requested value; we still send it so it takes effect when the proxy
-        //     limit is relaxed or when pointing at the upstream OpenAI API directly.
-        // style is intentionally not an API param — it's expected to be encoded in the prompt.
-        const reqBody: Record<string, unknown> = {
-          model: params.model || "gpt-image-2",
-          input: params.prompt,
-        };
-        if (params.size) reqBody.size = params.size;
-        if (params.quality) reqBody.quality = params.quality;
-
-        const response = await fetch("https://sub2api.alfadb.cn/v1/responses", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify(reqBody),
-        });
-
-        if (!response.ok) {
-          const err = await response.text().catch(() => "unknown");
-          return { content: [{ type: "text", text: `Image generation failed: ${response.status} ${err.slice(0, 500)}` }], isError: true };
-        }
-
-        const data = await response.json() as any;
-
-        // Extract base64 image from Responses API output, plus the actual size/quality
-        // the model used (so the saved file metadata reflects reality, not the request).
-        let imageBase64 = "";
-        let actualSize: string | undefined;
-        let actualQuality: string | undefined;
-        for (const item of data?.output ?? []) {
-          if (item.type === "image_generation_call" && item.result) {
-            imageBase64 = item.result;
-            actualSize = item.size;
-            actualQuality = item.quality;
-            break;
-          }
-        }
-
-        if (!imageBase64) {
-          return { content: [{ type: "text", text: "No image in response." }], isError: true };
-        }
-
-        // Save to file (current model may not support image display)
-        const outDir = path.join(ctx.cwd || os.homedir(), ".pi-multi-agent-output");
-        try { fs.mkdirSync(outDir, { recursive: true }); } catch {}
-        const filename = `image-${Date.now()}.png`;
-        const filepath = path.join(outDir, filename);
-        try { fs.writeFileSync(filepath, Buffer.from(imageBase64, "base64")); } catch {}
-
-        // Return both the image (if model supports it) and the file path.
-        // Report the actual size/quality the API used, falling back to requested.
-        const result: any = {
-          content: [{ type: "text", text: `✅ Image saved: ${filepath} (${actualSize ?? params.size ?? "default"}, quality=${actualQuality ?? params.quality ?? "default"})` }],
-          details: {
-            model: params.model || "gpt-image-2",
-            requestedSize: params.size,
-            actualSize,
-            requestedQuality: params.quality,
-            actualQuality,
-            path: filepath,
-          },
-        };
-
-        // If current model supports images, also return the base64
-        if (ctx.model?.input?.includes("image")) {
-          result.content.push({ type: "image", data: imageBase64, mimeType: "image/png" });
-        }
-
-        return result;
-      } catch (e: any) {
-        return { content: [{ type: "text", text: `Image generation error: ${e?.message || String(e)}` }], isError: true };
+      const callerSupportsImages = !!(ctx.model as any)?.input?.includes?.("image");
+      const r = await generateImage(params, {
+        cwd: ctx.cwd,
+        callerSupportsImages,
+        signal: _signal,
+      });
+      if (r.ok === false) {
+        return { content: [{ type: "text", text: r.error }], details: { error: r.error }, isError: true };
       }
+      const text =
+        `✅ Image saved: ${r.filepath} (${r.actualSize ?? r.requestedSize ?? "default"}, ` +
+        `quality=${r.actualQuality ?? r.requestedQuality ?? "default"})`;
+      const content: any[] = [{ type: "text", text }];
+      if (r.imageBase64 && r.mimeType) {
+        content.push({ type: "image", data: r.imageBase64, mimeType: r.mimeType });
+      }
+      return {
+        content,
+        details: {
+          model: r.model,
+          requestedSize: r.requestedSize,
+          actualSize: r.actualSize,
+          requestedQuality: r.requestedQuality,
+          actualQuality: r.actualQuality,
+          path: r.filepath,
+        },
+      };
     },
   });
 
@@ -452,120 +425,22 @@ export default function (pi: ExtensionAPI) {
     }),
 
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      try {
-        // Resolve image data: path > base64
-        let imageBase64 = params.imageBase64;
-        let mimeType = params.mimeType || "image/png";
-        if (params.path && !imageBase64) {
-          try {
-            const buf = fs.readFileSync(params.path);
-            imageBase64 = buf.toString("base64");
-            const ext = params.path.split('.').pop()?.toLowerCase();
-            if (ext === "jpg" || ext === "jpeg") mimeType = "image/jpeg";
-            else if (ext === "png") mimeType = "image/png";
-            else if (ext === "webp") mimeType = "image/webp";
-            else if (ext === "gif") mimeType = "image/gif";
-          } catch (e: any) {
-            return { content: [{ type: "text", text: `Failed to read image: ${e.message}` }], isError: true };
-          }
-        }
-        if (!imageBase64) {
-          return { content: [{ type: "text", text: "No image provided. Pass imageBase64 or path." }], isError: true };
-        }
-
-        // Load user preferences (project-local override of built-in defaults)
-        const cfg = loadConfig(ctx.cwd || process.cwd());
-        const prefs = cfg.visionModelPreferences ?? [];
-
-        // Score: lower index = more preferred. Unmatched -> prefs.length (sorted by cost after).
-        const scorePref = (m: any): number => {
-          const id = String(m.id || "").toLowerCase();
-          for (let i = 0; i < prefs.length; i++) {
-            const slash = prefs[i].indexOf("/");
-            if (slash < 0) continue;
-            const pProv = prefs[i].slice(0, slash);
-            const pPat = prefs[i].slice(slash + 1).toLowerCase();
-            if (m.provider === pProv && id.includes(pPat)) return i;
-          }
-          return prefs.length;
-        };
-
-        const isMain = (m: any) =>
-          ctx.model && m.provider === ctx.model.provider && m.id === ctx.model.id;
-
-        const visionModels = (await ctx.modelRegistry.getAvailable())
-          .filter((m: any) => m.input?.includes("image"))
-          .filter((m: any) => !isMain(m))
-          .map((m: any) => ({ m, pref: scorePref(m) }))
-          .sort((a: any, b: any) => {
-            if (a.pref !== b.pref) return a.pref - b.pref;
-            // Same pref bucket: pricier input ≈ stronger model (rough proxy)
-            return (b.m.cost?.input ?? 0) - (a.m.cost?.input ?? 0);
-          })
-          .map((x: any) => x.m);
-
-        if (visionModels.length === 0) {
-          return { content: [{ type: "text", text: "No vision-capable model available (other than the current main model). Configure another provider with image support." }], isError: true };
-        }
-
-        const bestVision = visionModels[0];
-        const auth = await ctx.modelRegistry.getApiKeyAndHeaders(bestVision);
-        if (!auth.ok || !auth.apiKey) {
-          return { content: [{ type: "text", text: `Auth failed for vision model: ${auth.error || "no key"}` }], isError: true };
-        }
-
-        // In-process call via pi-ai streamSimple — no subprocess, no ETIMEDOUT,
-        // no Windows .cmd shim issues. Image is sent as native ImageContent part.
-        try {
-          const piAi: any = await import("@mariozechner/pi-ai");
-          const userMsg = {
-            role: "user" as const,
-            content: [
-              { type: "image" as const, data: imageBase64, mimeType },
-              { type: "text" as const, text: params.prompt || "Describe this image" },
-            ],
-            timestamp: Date.now(),
-          };
-          const context = { messages: [userMsg] };
-          const stream = piAi.streamSimple(bestVision, context, {
-            apiKey: auth.apiKey,
-            headers: auth.headers,
-            signal: _signal,
-            timeoutMs: 120_000,
-            maxRetries: 1,
-          });
-          const finalMsg = await stream.result();
-
-          if (finalMsg.stopReason === "error" || finalMsg.stopReason === "aborted") {
-            const reason = finalMsg.errorMessage || finalMsg.stopReason;
-            return { content: [{ type: "text", text: `Vision analysis failed (${bestVision.provider}/${bestVision.id}): ${reason}` }], isError: true };
-          }
-
-          const text = (finalMsg.content as any[])
-            .filter((c) => c?.type === "text")
-            .map((c) => c.text)
-            .join("\n")
-            .trim();
-
-          if (!text) {
-            return { content: [{ type: "text", text: `Vision model returned no text (stopReason=${finalMsg.stopReason}).` }], isError: true };
-          }
-
-          return {
-            content: [{ type: "text", text: `## Vision Analysis (${bestVision.provider}/${bestVision.id})\n\n${text}` }],
-            details: {
-              model: `${bestVision.provider}/${bestVision.id}`,
-              usage: finalMsg.usage,
-              candidates: visionModels.slice(0, 5).map((m: any) => `${m.provider}/${m.id}`),
-            },
-          };
-        } catch (e: any) {
-          const msg = e?.message || String(e);
-          return { content: [{ type: "text", text: `Vision analysis failed (${bestVision.provider}/${bestVision.id}): ${msg.slice(0, 500)}` }], isError: true };
-        }
-      } catch (e: any) {
-        return { content: [{ type: "text", text: `Vision analysis error: ${e?.message || String(e)}` }], isError: true };
+      const cfg = loadConfig(ctx.cwd || process.cwd());
+      const r = await analyzeImage(params, {
+        modelRegistry: ctx.modelRegistry,
+        prefs: cfg.visionModelPreferences ?? [],
+        // If the main model supports images we shouldn't be calling vision —
+        // exclude it as a candidate so we always pick a *different* model.
+        excludeMain: ctx.model,
+        signal: _signal,
+      });
+      if (r.ok === false) {
+        return { content: [{ type: "text", text: r.error }], details: { error: r.error }, isError: true };
       }
+      return {
+        content: [{ type: "text", text: `## Vision Analysis (${r.model})\n\n${r.text}` }],
+        details: { model: r.model, usage: r.usage, candidates: r.candidates },
+      };
     },
   });
 }

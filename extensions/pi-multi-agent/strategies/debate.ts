@@ -3,51 +3,65 @@
  * Round 1: all models respond independently.
  * Rounds 2..N: each model reads others' previous-round responses and responds.
  * Final: synthesis model summarizes the debate.
+ *
+ * SDK-only: each turn is an in-process completeSimple call via runTask.
+ * Note: no in-process state is shared between rounds — each round is a fresh
+ * runTask call with a freshly-built prompt that embeds prior responses.
  */
 
-import type {
-  Task,
-  TaskResult,
-  DispatchOptions,
-  ResolvedModel,
-} from "../types.js";
-import { executeRpc } from "../backends/rpc.js";
-import { executePrint } from "../backends/print.js";
+import type { DispatchOptions, ResolvedModel, Task, TaskResult } from "../types.js";
+import { runTask, type RunnerCtx } from "../runner.js";
 
 export async function executeDebate(
   tasks: Task[],
   resolvedModels: Map<string, ResolvedModel>,
-  opts: DispatchOptions & { timeoutMs: number; extraFlags: string[] },
+  rctx: RunnerCtx,
+  opts: DispatchOptions,
 ): Promise<{ taskResults: TaskResult[]; synthesis: string }> {
   const rounds = opts.debateRounds ?? 2;
-  const mode = opts.executionMode ?? "rpc";
 
-  // Track all responses by round
-  const roundResults: Map<string, string[]>[] = [];
+  // roundResults[r] is a map: taskId → text response in round r (1-indexed below).
+  const roundResults: Map<string, string>[] = [];
 
-  // Round 1: independent responses
-  const r1Jobs = tasks.map((task) => {
+  // Round 1: independent responses.
+  const r1Jobs = tasks.map(async (task) => {
     const resolved = resolvedModels.get(task.id);
-    if (!resolved) throw new Error(`Model not found: ${task.model}`);
-    return executeSingle(task, resolved, mode, opts);
+    if (!resolved) {
+      return {
+        taskId: task.id,
+        model: task.model,
+        role: task.role,
+        output: "",
+        error: `Model not found: ${task.model}`,
+        durationMs: 0,
+      } as TaskResult;
+    }
+    return runTask(task, resolved, rctx);
   });
-
   const r1Results = await Promise.all(r1Jobs);
-  roundResults.push(new Map(tasks.map((t, i) => [t.id, [r1Results[i].output]])));
+  roundResults.push(new Map(tasks.map((t, i) => [t.id, r1Results[i].output])));
 
-  // Rounds 2..N: cross-response
+  // Rounds 2..N: cross-response.
   for (let r = 2; r <= rounds; r++) {
+    const previousRound = roundResults[r - 2];
     const roundJobs = tasks.map(async (task, idx) => {
       const resolved = resolvedModels.get(task.id);
-      if (!resolved) throw new Error(`Model not found: ${task.model}`);
+      if (!resolved) {
+        return {
+          taskId: task.id,
+          model: task.model,
+          role: task.role,
+          output: "",
+          error: `Model not found: ${task.model}`,
+          durationMs: 0,
+        } as TaskResult;
+      }
 
-      // Build prompt with others' previous responses
       const othersResponses = tasks
         .filter((_, j) => j !== idx)
         .map((other) => {
-          const responses = roundResults[r - 2].get(other.id) ?? [];
-          const lastResp = responses[responses.length - 1] ?? "(no response)";
-          return `## ${other.role ?? other.id}'s response\n\n${lastResp}`;
+          const resp = previousRound.get(other.id) ?? "(no response)";
+          return `## ${other.role ?? other.id}'s response\n\n${resp}`;
         })
         .join("\n\n");
 
@@ -64,26 +78,19 @@ export async function executeDebate(
       ].join("\n");
 
       const roundTask: Task = { ...task, prompt: debatePrompt };
-      return executeSingle(roundTask, resolved, mode, opts);
+      return runTask(roundTask, resolved, rctx);
     });
 
-    const roundResultsArr = await Promise.all(roundJobs);
-    for (let i = 0; i < tasks.length; i++) {
-      const existing = roundResults[r - 2].get(tasks[i].id) ?? [];
-      existing.push(roundResultsArr[i].output);
-      roundResults.push(
-        new Map([[tasks[i].id, existing]]),
-      );
-    }
+    const roundArr = await Promise.all(roundJobs);
+    roundResults.push(new Map(tasks.map((t, i) => [t.id, roundArr[i].output])));
   }
 
-  // Merge per-task results for display
+  // Merge per-task results: concatenate each task's responses across all rounds.
   const taskResults: TaskResult[] = tasks.map((task) => {
-    // Find all this task's responses across rounds
     const allRounds: string[] = [];
     for (const rm of roundResults) {
-      const responses = rm.get(task.id);
-      if (responses) allRounds.push(...responses);
+      const resp = rm.get(task.id);
+      if (resp) allRounds.push(resp);
     }
     return {
       taskId: task.id,
@@ -94,12 +101,14 @@ export async function executeDebate(
     };
   });
 
-  // Synthesis
+  // Synthesis: dedicated model summarizes the debate.
   const synthesisPrompt = buildSynthesisPrompt(tasks, roundResults, rounds);
   const synthesisModel = opts.synthesisModel ?? tasks[0].model;
-  const synthesisResolved = resolvedModels.get("__synthesis__")
-    ?? resolvedModels.get(tasks[0].id);
-  if (!synthesisResolved) throw new Error("No model for synthesis");
+  const synthesisResolved =
+    resolvedModels.get("__synthesis__") ?? resolvedModels.get(tasks[0].id);
+  if (!synthesisResolved) {
+    return { taskResults, synthesis: "Synthesis failed: no model resolvable" };
+  }
 
   const synthesisTask: Task = {
     id: "__synthesis__",
@@ -107,15 +116,19 @@ export async function executeDebate(
     thinking: opts.synthesisThinking ?? "high",
     prompt: synthesisPrompt,
   };
+  const synthesisResult = await runTask(synthesisTask, synthesisResolved, rctx);
 
-  const synthesisResult = await executeSingle(synthesisTask, synthesisResolved, mode, opts);
-
-  return { taskResults, synthesis: synthesisResult.output };
+  return {
+    taskResults,
+    synthesis: synthesisResult.error
+      ? `Synthesis failed: ${synthesisResult.error}`
+      : synthesisResult.output,
+  };
 }
 
 function buildSynthesisPrompt(
   tasks: Task[],
-  roundResults: Map<string, string[]>[],
+  roundResults: Map<string, string>[],
   totalRounds: number,
 ): string {
   const parts: string[] = [
@@ -130,11 +143,10 @@ function buildSynthesisPrompt(
   for (let r = 0; r < totalRounds; r++) {
     parts.push(`### Round ${r + 1}`);
     for (const task of tasks) {
-      const responses = roundResults[r]?.get(task.id) ?? [];
-      const lastResp = responses[responses.length - 1];
-      if (lastResp) {
+      const resp = roundResults[r]?.get(task.id);
+      if (resp) {
         parts.push(`#### ${task.role ?? task.id}`);
-        parts.push(lastResp);
+        parts.push(resp);
         parts.push("");
       }
     }
@@ -151,22 +163,4 @@ function buildSynthesisPrompt(
   );
 
   return parts.join("\n");
-}
-
-async function executeSingle(
-  task: Task,
-  resolved: ResolvedModel,
-  mode: string,
-  opts: { timeoutMs: number; extraFlags: string[] },
-): Promise<TaskResult> {
-  if (mode === "rpc") {
-    return executeRpc(task, resolved, {
-      taskTimeoutMs: opts.timeoutMs,
-      extraFlags: opts.extraFlags,
-    });
-  }
-  return executePrint(task, resolved, {
-    taskTimeoutMs: opts.timeoutMs,
-    extraFlags: opts.extraFlags,
-  });
 }

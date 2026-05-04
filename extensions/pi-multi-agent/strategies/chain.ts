@@ -1,25 +1,18 @@
 /**
  * Chain strategy — tasks execute sequentially, each receiving the previous output.
  * A→B→C: model A does work, model B reviews/extends, model C refines.
+ * SDK-only: each step is an in-process completeSimple call via runTask.
  */
 
-import type {
-  Task,
-  TaskResult,
-  DispatchOptions,
-  ResolvedModel,
-} from "../types.js";
-import { executePrint } from "../backends/print.js";
-import { executeRpc } from "../backends/rpc.js";
+import type { DispatchOptions, ResolvedModel, Task, TaskResult } from "../types.js";
+import { runTask, type RunnerCtx } from "../runner.js";
 
 export async function executeChain(
   tasks: Task[],
   resolvedModels: Map<string, ResolvedModel>,
-  opts: DispatchOptions & { timeoutMs: number; extraFlags: string[] },
+  rctx: RunnerCtx,
+  _opts: DispatchOptions,
 ): Promise<TaskResult[]> {
-  const mode = opts.executionMode ?? "rpc";
-  const executor = mode === "rpc" ? executeRpc : executePrint;
-
   const results: TaskResult[] = [];
   let previousOutput = "";
 
@@ -37,7 +30,7 @@ export async function executeChain(
       continue;
     }
 
-    // Build chain prompt: include previous step's output
+    // Build chain prompt: include previous step's output.
     let chainPrompt = task.prompt;
     if (previousOutput && results.length > 0) {
       const prev = results[results.length - 1];
@@ -53,11 +46,7 @@ export async function executeChain(
     }
 
     const chainTask: Task = { ...task, prompt: chainPrompt };
-    const result = await executor(chainTask, resolved, {
-      taskTimeoutMs: opts.timeoutMs,
-      extraFlags: opts.extraFlags,
-    });
-
+    const result = await runTask(chainTask, resolved, rctx);
     results.push(result);
     previousOutput = result.output;
   }
