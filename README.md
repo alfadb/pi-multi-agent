@@ -95,17 +95,21 @@ multi_dispatch(strategy, tasks[], options?)
 
 ## 使用示例
 
+> **关于以下示例中的模型名**
+>
+> 示例里出现的模型 id是占位符 `<provider/model>`，提醒你该到哪里填。实际使用时，主会话 LLM 会从 **pi-model-curator** 注入的 *Available models (curated)* 表中选择实际可用且合适的型号 —— 不要从本 README 拷具体型号名（如 README 与 curator 漂移，以 curator 为准）。
+
 ### 并行代码审查
 
 ```
 multi_dispatch(
   strategy="parallel",
   tasks=[
-    {id:"sec", model:"anthropic/claude-sonnet-4", thinking:"xhigh",
+    {id:"sec",  model:"<provider/model>", thinking:"xhigh",
      prompt:"审查这个 diff 的安全问题：{DIFF}", tools:"readonly"},
-    {id:"perf", model:"deepseek/deepseek-v4-pro", thinking:"xhigh",
+    {id:"perf", model:"<provider/model>", thinking:"xhigh",
      prompt:"审查这个 diff 的性能问题：{DIFF}", tools:"readonly"},
-    {id:"arch", model:"openai/gpt-5.5", thinking:"xhigh",
+    {id:"arch", model:"<provider/model>", thinking:"xhigh",
      prompt:"审查这个 diff 的架构问题：{DIFF}", tools:"readonly"},
   ]
 )
@@ -117,14 +121,14 @@ multi_dispatch(
 multi_dispatch(
   strategy="debate",
   tasks=[
-    {id:"ceo", model:"openai/gpt-5.5", thinking:"xhigh",
+    {id:"ceo", model:"<provider/model>", thinking:"xhigh",
      role:"CEO", prompt:"评估这个产品方案：{PROPOSAL}"},
-    {id:"cto", model:"anthropic/claude-sonnet-4", thinking:"xhigh",
+    {id:"cto", model:"<provider/model>", thinking:"xhigh",
      role:"CTO", prompt:"评估这个产品方案：{PROPOSAL}"},
-    {id:"cfo", model:"deepseek/deepseek-v4-pro", thinking:"xhigh",
+    {id:"cfo", model:"<provider/model>", thinking:"xhigh",
      role:"CFO", prompt:"评估这个产品方案：{PROPOSAL}"},
   ],
-  options={debateRounds:3, synthesisModel:"openai/gpt-5.5"}
+  options={debateRounds:3, synthesisModel:"<provider/model>"}
 )
 ```
 
@@ -139,12 +143,12 @@ export PI_MULTI_AGENT_ALLOW_MUTATING=1
 multi_dispatch(
   strategy="chain",
   tasks=[
-    {id:"impl", model:"openai/gpt-5.5", thinking:"xhigh",
+    {id:"impl",   model:"<provider/model>", thinking:"xhigh",
      prompt:"在 src/auth.ts 中实现 JWT 鉴权中间件",
      tools:"read,edit,write"},
-    {id:"review", model:"anthropic/claude-sonnet-4", thinking:"xhigh",
+    {id:"review", model:"<provider/model>", thinking:"xhigh",
      prompt:"审查上述实现的安全漏洞", tools:"readonly"},
-    {id:"fix", model:"openai/gpt-5.5", thinking:"xhigh",
+    {id:"fix",    model:"<provider/model>", thinking:"xhigh",
      prompt:"根据审查意见修复安全问题", tools:"read,edit,write"},
   ]
 )
@@ -156,12 +160,12 @@ multi_dispatch(
 multi_dispatch(
   strategy="ensemble",
   tasks=[
-    {id:"a", model:"openai/gpt-5.5", thinking:"xhigh",
+    {id:"a", model:"<provider/model>", thinking:"xhigh",
      prompt:"这个数据库选型方案有什么风险？"},
-    {id:"b", model:"deepseek/deepseek-v4-pro", thinking:"xhigh",
+    {id:"b", model:"<provider/model>", thinking:"xhigh",
      prompt:"这个数据库选型方案有什么风险？"},
   ],
-  options={synthesisModel:"openai/gpt-5.5"}
+  options={synthesisModel:"<provider/model>"}
 )
 ```
 
@@ -171,7 +175,7 @@ multi_dispatch(
 multi_dispatch(
   strategy="parallel",
   tasks=[
-    {id:"design-review", model:"openai/gpt-5.5",
+    {id:"design-review", model:"<provider/model with image-in>",
      thinking:"high", tools:"vision,readonly",
      prompt:"用 vision 工具看 ./mockup.png，给出 UX 改进意见"},
   ]
@@ -187,10 +191,7 @@ multi_dispatch(
   "taskTimeoutMs": 600000,
   "debateRounds": 3,
   "synthesisThinking": "xhigh",
-  "visionModelPreferences": [
-    "openai/gpt-5.5",
-    "anthropic/claude-opus-4-7"
-  ]
+  "visionModelPreferences": []
 }
 ```
 

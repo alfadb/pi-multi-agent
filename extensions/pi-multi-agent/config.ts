@@ -26,9 +26,11 @@ export interface MultiAgentConfig {
    * cost.input descending as a rough capability proxy.
    * The current main model is excluded by the vision tool itself.
    *
-   * IMPORTANT: keep this list aligned with pi-model-curator's whitelist. Entries
-   * matching curated-out variants (e.g. "-pro", "-mini-3") are dead — the registry
-   * never returns those models, so they cost a sort step and signal nothing.
+   * Default is now an EMPTY list — model selection authority lives in pi-model-curator,
+   * which advertises capability hints (including image-input flag) into the main session
+   * system prompt. Vision-core falls back to cost.input descending across all
+   * image-capable models, which is a reasonable proxy for "strongest available". A
+   * project that wants a hard preference can still set this in .pi-multi-agent/config.json.
    */
   visionModelPreferences: string[];
 }
@@ -37,13 +39,7 @@ export const DEFAULT_CONFIG: MultiAgentConfig = {
   taskTimeoutMs: 300_000,
   debateRounds: 2,
   synthesisThinking: "high",
-  visionModelPreferences: [
-    "openai/gpt-5.5",
-    "anthropic/claude-opus-4-7",
-    "anthropic/claude-opus",
-    "anthropic/claude-sonnet",
-    "google/gemini",
-  ],
+  visionModelPreferences: [],
 };
 
 function readJsonSafe(p: string): Record<string, unknown> {

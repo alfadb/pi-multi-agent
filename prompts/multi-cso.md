@@ -4,13 +4,13 @@
 
 ## 模型选择
 
-先执行 `pi --list-models` 确认可用模型。每个维度按需求选择模型：
+参考系统提示中的 **Available models (curated)** 表格，按 hint 列匹配安全审计的不同维度：
 
-- 依赖审计、基础设施 → deepseek-v4-pro（结构化分析强）
-- OWASP、STRIDE、LLM安全 → opus-4-7 或 gpt-5.5（推理最强）
-- 数据分类 → 中强模型即可
+- 结构化/列表型任务（依赖审计、基础设施检查）→选 hint 提到“structured analysis”或大上下文的推理型模型
+- 深度推理型任务（OWASP、STRIDE、LLM 威胁建模）→选 hint 提到“strongest reasoning”或 opus 类模型
+- 轻量分类（数据分类、事件打标）→选 sonnet/mini/flash 等中强模型
 
-无首选时自动降级。thinking 统一 `xhigh`。
+thinking 统一 `xhigh`；所选模型必须出现在当前 Available 表中。
 
 ## 执行
 

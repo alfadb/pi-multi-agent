@@ -4,12 +4,13 @@
 
 ## 模型选择
 
-先执行 `pi --list-models` 确认可用模型。**攻击者和防守者必须选择不同 provider 系列的最强模型**：
+参考系统提示中的 **Available models (curated)** 表格。**攻击者和防守者必须选择不同 provider 系列的推理型模型**（`reasoning: ✓`）以防止共同盲点：
 
-- 攻击者（red-team）：需要最强推理，找漏洞、构造攻击。优先 openai/gpt-5.5，其次 anthropic 最强
-- 防守者（blue-team）：需要最强推理，澄清误报、评估影响。优先 anthropic 最强，其次 openai/gpt-5.5
+- 攻击者（red-team）：从 hint 提到“strongest reasoning”的模型中选一个
+- 防守者（blue-team）：从另一个 provider 的推理型模型中选一个
+- 综合模型：选第三个 provider；不足时复用攻击者模型
 
-thinking 统一 `xhigh`。综合模型用第三个 provider 或攻击者模型。
+thinking 统一 `xhigh`。
 
 ## 执行
 

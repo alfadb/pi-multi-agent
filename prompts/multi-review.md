@@ -9,25 +9,25 @@
 
 ## 模型选择原则
 
-根据以下角色需求从当前可用模型中优选。无对应模型时自动降级。
+参考系统提示中的 **Available models (curated)** 表格。为每个 specialist 按 hint 列匹配需求，并保证多个 specialist 的模型跨 provider 多样化（不要所有 specialist 都选同一 provider）。
 
-| Specialist | 模型需求 | 首选 | 备选 |
-|---|---|---|---|
-| testing | 覆盖测试缺口需要结构化推理 | deepseek/deepseek-v4-pro | openai/gpt-5.5 |
-| security | 安全审查需要最强的推理能力（opus级别 > sonnet > 其他） | anthropic/claude-opus-4-7 | deepseek-v4-pro |
-| maintainability | 可维护性审查，中等推理即可 | anthropic/claude-opus-4-7 | openai/gpt-5.5 |
-| performance | 性能审查需要结构化推理 | deepseek/deepseek-v4-pro | openai/gpt-5.5 |
-| api-contract | API 契约审查，中等推理 | openai/gpt-5.5 | deepseek-v4-pro |
-| data-migration | 数据迁移审查，中等推理 | deepseek/deepseek-v4-pro | openai/gpt-5.5 |
+角色需求描述：
 
-thinking 等级:
+| Specialist | 模型需求（去 Available 表中按 hint 匹配） |
+|---|---|
+| testing | 覆盖测试缺口需要结构化、列表化推理 |
+| security | 安全审查需要最强推理能力（hint 提到 “strongest reasoning” 的优先） |
+| maintainability | 代码架构/可维护性，需要跨文件综合 |
+| performance | 性能分析，需要结构化、大上下文 |
+| api-contract | API 契约审查，中等推理 |
+| data-migration | 数据迁移审查，中等推理 |
+
+thinking 等级：
 - security → `xhigh`
 - testing/performance → `xhigh`
 - maintainability/api-contract/data-migration → `high`
 
 ## 执行
-
-先执行 `pi --list-models` 确认当前可用模型，然后按上述原则选择模型，调用：
 
 ```
 multi_dispatch(

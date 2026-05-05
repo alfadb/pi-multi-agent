@@ -4,13 +4,7 @@
 
 ## 模型选择
 
-先执行 `pi --list-models` 确认可用模型。**每个角色选择不同 provider 系列的最强模型**，以最大化视角多样性：
-
-- anthropic 系列 → 选最强的（opus > sonnet > haiku）
-- openai 系列 → 选最强的（pro > 普通 > mini）
-- deepseek 系列 → 选最强的（pro > flash）
-
-如不足 3 个 provider 可用，从同一 provider 选不同模型。thinking 统一 `xhigh`。
+参考系统提示中的 **Available models (curated)** 表格。**每个角色选择不同 provider 系列的模型**以最大化视角多样性；按 hint 列匹配角色需求（推理深度 / 成本 / 速度）。如可用 provider 不足 3 个，从同一 provider 选 hint 差异最大的两条。thinking 统一 `xhigh`，除非任务对延迟特别敏感。
 
 ## 执行
 

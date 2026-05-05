@@ -4,7 +4,7 @@
 
 ## 模型选择
 
-先执行 `pi --list-models` 确认可用模型。**每个角色选择不同 provider 系列的最强模型**（anthropic: opus > sonnet, openai: pro > 普通, deepseek: pro > flash）。不足 3 个 provider 时从同一 provider 选不同模型。thinking 统一 `xhigh`。
+参考系统提示中的 **Available models (curated)** 表格。每个诊断者选择不同 provider 的推理型模型（`reasoning: ✓`）以最大化诊断思路多样性。不足 3 个 provider 时同一 provider 选 hint 差异最大的多条。thinking 统一 `xhigh`。
 
 ## 执行
 
