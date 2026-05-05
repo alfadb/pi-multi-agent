@@ -54,8 +54,9 @@ const TaskSchema = Type.Object({
     Type.String({
       description:
         "Comma-separated tool allowlist. Built-ins: read, bash, edit, write, grep, find, ls. " +
-        'Aliases: "readonly" (=read,grep,find,ls), "coding" (=read+bash+edit+write+grep+find+ls). ' +
-        "Multi-agent: vision, imagine. Anything else (incl. multi_dispatch) is rejected.",
+        'Alias: "readonly" (=read,grep,find,ls). ' +
+        "Multi-agent: vision, imagine. Mutating built-ins (bash/edit/write) require " +
+        "PI_MULTI_AGENT_ALLOW_MUTATING=1. Anything else (incl. multi_dispatch) is rejected.",
     }),
   ),
 });
@@ -210,9 +211,17 @@ function formatResult(result: DispatchResult): string {
     const dur = (task.durationMs / 1000).toFixed(1);
     lines.push(`### ${task.taskId}${role} — ${task.model} [${dur}s]`);
 
+    // Error and partial output coexist in two real cases:
+    //   1. debate strategy aggregates rounds — earlier rounds may have
+    //      produced text before a later round errored.
+    //   2. tool-loop tasks may emit partial text before the loop hits a
+    //      stopReason of error/length/aborted (runner returns both).
+    // Showing only the error in those cases hides the actual model output
+    // the user paid tokens for. Surface both.
     if (task.error) {
       lines.push(`**Error:** ${task.error}`);
-    } else {
+    }
+    if (task.output) {
       const output = task.output.length > 8000
         ? task.output.slice(0, 8000) + "\n\n[...truncated...]"
         : task.output;
@@ -257,7 +266,7 @@ export default function (pi: ExtensionAPI) {
       "Choose strategy: parallel for independent analysis, debate for collaborative discussion, chain for sequential refinement, ensemble for independent votes + synthesis.",
       "Assign different models per task based on strengths: Claude for security, GPT for architecture, DeepSeek for performance.",
       "Set thinking level per task: xhigh for critical analysis, off for simple lookups.",
-      "Subagent tool access: omit `tools` for pure reasoning. Use 'readonly' (read,grep,find,ls) for code review. Use 'coding' for tasks that must edit files. Add 'vision' or 'imagine' explicitly when needed.",
+      "Subagent tool access: omit `tools` for pure reasoning. Use 'readonly' (read,grep,find,ls) for code review. To edit files, list 'read,edit,write' explicitly AND set PI_MULTI_AGENT_ALLOW_MUTATING=1 in env (no 'coding' alias — naming would imply safety it can't deliver). Add 'vision' or 'imagine' explicitly when needed.",
       "The tool runs asynchronously and returns merged results. Check task error fields for failures.",
     ],
     parameters: Type.Object({

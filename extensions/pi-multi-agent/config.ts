@@ -21,10 +21,14 @@ export interface MultiAgentConfig {
   /**
    * Vision tool: ordered preference list, most-preferred first.
    * Each entry is "provider/idSubstring" — substring match on model id (case-insensitive),
-   * tolerant of version suffixes (e.g. "openai/gpt-5.5-pro" matches "gpt-5.5-pro-2026-07-15").
+   * tolerant of version suffixes (e.g. "openai/gpt-5.5" matches "gpt-5.5-2026-07-15").
    * Models matching earlier entries win. Unmatched models still participate, ordered by
    * cost.input descending as a rough capability proxy.
    * The current main model is excluded by the vision tool itself.
+   *
+   * IMPORTANT: keep this list aligned with pi-model-curator's whitelist. Entries
+   * matching curated-out variants (e.g. "-pro", "-mini-3") are dead — the registry
+   * never returns those models, so they cost a sort step and signal nothing.
    */
   visionModelPreferences: string[];
 }
@@ -34,12 +38,9 @@ export const DEFAULT_CONFIG: MultiAgentConfig = {
   debateRounds: 2,
   synthesisThinking: "high",
   visionModelPreferences: [
-    "openai/gpt-5.5-pro",
     "openai/gpt-5.5",
     "anthropic/claude-opus-4-7",
-    "openai/gpt-5",
     "anthropic/claude-opus",
-    "openai/gpt-4.1",
     "anthropic/claude-sonnet",
     "google/gemini",
   ],

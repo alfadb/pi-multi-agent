@@ -7,7 +7,7 @@
 先执行 `pi --list-models` 确认可用模型。每个维度按需求选择模型：
 
 - 依赖审计、基础设施 → deepseek-v4-pro（结构化分析强）
-- OWASP、STRIDE、LLM安全 → gpt-5.5-pro 或 opus-4-7（推理最强）
+- OWASP、STRIDE、LLM安全 → opus-4-7 或 gpt-5.5（推理最强）
 - 数据分类 → 中强模型即可
 
 无首选时自动降级。thinking 统一 `xhigh`。

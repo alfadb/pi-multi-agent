@@ -117,7 +117,7 @@ multi_dispatch(
 multi_dispatch(
   strategy="debate",
   tasks=[
-    {id:"ceo", model:"openai/gpt-5.5-pro", thinking:"xhigh",
+    {id:"ceo", model:"openai/gpt-5.5", thinking:"xhigh",
      role:"CEO", prompt:"评估这个产品方案：{PROPOSAL}"},
     {id:"cto", model:"anthropic/claude-sonnet-4", thinking:"xhigh",
      role:"CTO", prompt:"评估这个产品方案：{PROPOSAL}"},
@@ -188,7 +188,7 @@ multi_dispatch(
   "debateRounds": 3,
   "synthesisThinking": "xhigh",
   "visionModelPreferences": [
-    "openai/gpt-5.5-pro",
+    "openai/gpt-5.5",
     "anthropic/claude-opus-4-7"
   ]
 }

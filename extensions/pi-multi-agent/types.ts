@@ -24,7 +24,10 @@ export interface Task {
    *
    * Accepted entries:
    *   - SDK built-ins: read, bash, edit, write, grep, find, ls
-   *   - Aliases: "readonly" (=read,grep,find,ls), "coding" (=read,bash,edit,write,grep,find,ls)
+   *     (mutating: bash/edit/write require env PI_MULTI_AGENT_ALLOW_MUTATING=1)
+   *   - Alias: "readonly" (=read,grep,find,ls). The historical "coding" alias
+   *     was removed in 32c262b because the name implied safety and it bundled
+   *     write tools; list mutating tools explicitly to opt in.
    *   - Multi-agent self-delegatable tools: vision, imagine
    *
    * Anything else (including multi_dispatch and third-party extension tools)

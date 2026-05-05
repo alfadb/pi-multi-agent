@@ -53,12 +53,62 @@ export interface ImagineErr {
 }
 export type ImagineResult = ImagineOk | ImagineErr;
 
+// Default endpoint: alfadb's sub2api proxy. Override with PI_IMAGINE_BASE_URL.
+const DEFAULT_IMAGINE_BASE_URL = "https://sub2api.alfadb.cn";
+// Whether `baseUrl` points to a third-party proxy rather than openai.com
+// directly. We err on the side of "third party" — only api.openai.com is
+// considered first-party. sub2api.alfadb.cn, custom corp gateways, and
+// other providers all count as third-party, which gates which env keys
+// we accept (see comment in generateImage).
+function isFirstPartyOpenAI(baseUrl: string): boolean {
+  try {
+    const u = new URL(baseUrl);
+    return u.hostname === "api.openai.com";
+  } catch {
+    return false;
+  }
+}
+
 export async function generateImage(input: ImagineInput, deps: ImagineDeps): Promise<ImagineResult> {
-  const apiKey = process.env.SUB2API_API_KEY_OPENAI || process.env.OPENAI_API_KEY;
+  const baseUrl = process.env.PI_IMAGINE_BASE_URL?.trim() || DEFAULT_IMAGINE_BASE_URL;
+
+  // Credential routing rules:
+  //   - SUB2API_API_KEY_OPENAI is provider-specific to alfadb's sub2api and
+  //     by definition belongs to that proxy; always acceptable.
+  //   - OPENAI_API_KEY is a *first-party* OpenAI credential. Sending it to
+  //     a third-party proxy means handing off the user's OpenAI account to
+  //     a vendor they did not consent to. We refuse this unless either
+  //       (a) baseUrl points to api.openai.com (first-party), OR
+  //       (b) the user explicitly opted in via PI_IMAGINE_ALLOW_OPENAI_KEY_PROXY=1
+  //     This closes the silent-key-leak path where a user setting the
+  //     standard OPENAI_API_KEY ships their OpenAI credentials to
+  //     sub2api.alfadb.cn (or any other gateway) without disclosure.
+  let apiKey = process.env.SUB2API_API_KEY_OPENAI;
+  if (!apiKey) {
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (openaiKey) {
+      const firstParty = isFirstPartyOpenAI(baseUrl);
+      const optedIn = process.env.PI_IMAGINE_ALLOW_OPENAI_KEY_PROXY === "1";
+      if (firstParty || optedIn) {
+        apiKey = openaiKey;
+      } else {
+        return {
+          ok: false,
+          error:
+            `OPENAI_API_KEY is set but PI_IMAGINE_BASE_URL is a third-party endpoint (${baseUrl}). ` +
+            "Refusing to forward your OpenAI credential to a non-OpenAI host. " +
+            "To proceed, either: " +
+            "(a) set PI_IMAGINE_BASE_URL=https://api.openai.com to call OpenAI directly, " +
+            "(b) set SUB2API_API_KEY_OPENAI to a sub2api-specific key, or " +
+            "(c) set PI_IMAGINE_ALLOW_OPENAI_KEY_PROXY=1 to acknowledge the risk explicitly.",
+        };
+      }
+    }
+  }
   if (!apiKey) {
     return {
       ok: false,
-      error: "No OpenAI API key found. Set OPENAI_API_KEY or SUB2API_API_KEY_OPENAI.",
+      error: "No image-generation API key found. Set SUB2API_API_KEY_OPENAI for sub2api, or set OPENAI_API_KEY together with PI_IMAGINE_BASE_URL=https://api.openai.com for direct OpenAI access.",
     };
   }
 
@@ -77,16 +127,13 @@ export async function generateImage(input: ImagineInput, deps: ImagineDeps): Pro
   if (input.size) reqBody.size = input.size;
   if (input.quality) reqBody.quality = input.quality;
 
-  // NOTE: this endpoint is the alfadb-internal sub2api proxy, not OpenAI direct.
-  // The proxy forwards to upstream OpenAI but rewrites quality/auth headers.
-  // Both SUB2API_API_KEY_OPENAI and OPENAI_API_KEY are accepted; either way
-  // the credential is sent to a *third party* (sub2api.alfadb.cn), not
-  // OpenAI directly. Document this in any deployment that ships outside the
-  // alfadb infrastructure. A future change should accept OPENAI_BASE_URL to
-  // allow direct routing.
+  // baseUrl is from PI_IMAGINE_BASE_URL or the sub2api default. Both the
+  // default and standard openai routing put the Responses endpoint at
+  // /v1/responses, so we suffix that universally.
+  const url = `${baseUrl.replace(/\/$/, "")}/v1/responses`;
   let response: Response;
   try {
-    response = await fetch("https://sub2api.alfadb.cn/v1/responses", {
+    response = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",

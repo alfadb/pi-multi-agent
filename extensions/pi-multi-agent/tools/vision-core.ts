@@ -9,6 +9,7 @@
  */
 
 import * as fs from "node:fs/promises";
+import * as fsSync from "node:fs";
 import * as path from "node:path";
 import type { Model } from "@mariozechner/pi-ai";
 
@@ -35,7 +36,7 @@ export interface VisionInput {
 export interface VisionDeps {
   /** ModelRegistry from ctx.modelRegistry — used to enumerate vision-capable models. */
   modelRegistry: any;
-  /** Ordered preference list, e.g. ["openai/gpt-5.5-pro", "anthropic/claude-opus"]. */
+  /** Ordered preference list, e.g. ["openai/gpt-5.5", "anthropic/claude-opus"]. */
   prefs: string[];
   /**
    * Model to exclude from candidates (typically the main agent's current model:
@@ -92,14 +93,31 @@ function validateImagePath(userPath: string, cwd: string | undefined): { ok: tru
       error: `Image path extension '${ext || "(none)"}' not allowed. Permitted: ${[...ALLOWED_IMAGE_EXTS].join(", ")}`,
     };
   }
-  const root = path.resolve(cwd ?? process.cwd());
-  const abs = path.resolve(root, userPath);
+  const rootRaw = path.resolve(cwd ?? process.cwd());
+  const absRaw = path.resolve(rootRaw, userPath);
+
+  // TOCTOU symlink defense: a path-string check on the user-supplied path
+  // alone passes for `<cwd>/evil.png` even when evil.png is a symlink to
+  // /etc/passwd or ~/.ssh/id_rsa. fs.readFile follows symlinks, so we'd
+  // base64-encode the secret and ship it to a third-party vision provider.
+  //
+  // Defense: resolve symlinks on BOTH sides, then prefix-check. If the
+  // symlink target escapes the project root, reject. If the user-path
+  // doesn't exist yet, fall back to the lexical check (it can't be a
+  // symlink-to-secret if it doesn't exist).
+  let root: string;
+  let abs: string;
+  try { root = fsSync.realpathSync(rootRaw); }
+  catch { root = rootRaw; }
+  try { abs = fsSync.realpathSync(absRaw); }
+  catch { abs = absRaw; }
+
   // Trailing-separator guard: ensure /a/bc isn't treated as inside /a/b.
   const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
   if (abs !== root && !abs.startsWith(rootWithSep)) {
     return {
       ok: false,
-      error: `Image path '${userPath}' resolves outside the project root.`,
+      error: `Image path '${userPath}' resolves outside the project root (after symlink resolution).`,
     };
   }
   return { ok: true, abs, ext };
