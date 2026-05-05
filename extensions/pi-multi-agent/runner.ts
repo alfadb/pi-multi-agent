@@ -16,6 +16,7 @@ import { completeSimple } from "@mariozechner/pi-ai";
 import type { AssistantMessage, Context, Message, ToolCall } from "@mariozechner/pi-ai";
 import type { ResolvedModel, Task, TaskResult } from "./types.js";
 import { buildSubagentTools, rejectionMessage } from "./subagent-tools.js";
+import { logEvent, clip } from "./logger.js";
 
 /** Maximum tool-calling iterations before forced termination. Real research
  *  tasks rarely exceed 10-20 turns; 50 is a generous safety cap. */
@@ -47,6 +48,19 @@ export interface RunnerCtx {
   taskTimeoutMs: number;
   /** Parent abort signal (from extension ctx). Honored end-to-end. */
   signal?: AbortSignal;
+  /**
+   * Correlation id for the parent dispatch. Lets dispatch.log readers tie
+   * task:* lines to the dispatch:start that produced them. Optional so
+   * direct callers (e.g. tests using runTask in isolation) don't need to
+   * fabricate one.
+   */
+  dispatchId?: string;
+  /**
+   * Strategy that initiated this task (parallel/debate/chain/ensemble or
+   * "synthesis" for the synthesis pass). Logged with each task event for
+   * post-hoc filtering.
+   */
+  strategy?: string;
 }
 
 function extractText(msg: AssistantMessage): string {
@@ -77,6 +91,21 @@ export async function runTask(
 ): Promise<TaskResult> {
   const start = Date.now();
   const modelId = `${resolved.provider}/${resolved.modelId}`;
+  const logCtx = rctx.cwd;
+  // task:start — first observable signal that *this specific* (model, task)
+  // pair is being dispatched. Includes thinking level, tool whitelist (raw
+  // string), and a short prompt preview so a forensic reader can correlate
+  // log lines with what the LLM actually saw.
+  logEvent(logCtx, "task:start", {
+    dispatch: rctx.dispatchId,
+    strategy: rctx.strategy,
+    id: task.id,
+    role: task.role,
+    model: modelId,
+    thinking: task.thinking,
+    tools: task.tools ?? "-",
+    prompt: clip(task.prompt, 100),
+  });
 
   // Per-task abort: linked to parent signal so ESC propagates immediately.
   // CRITICAL: if parent signal is *already* aborted before runTask is called
@@ -104,6 +133,14 @@ export async function runTask(
       visionPrefs: rctx.visionPrefs,
     });
     if (built.rejected.length > 0) {
+      logEvent(logCtx, "task:end", {
+        dispatch: rctx.dispatchId,
+        id: task.id,
+        model: modelId,
+        status: "rejected_tools",
+        rejected: built.rejected.join(","),
+        durationMs: Date.now() - start,
+      });
       return {
         taskId: task.id,
         model: modelId,
@@ -129,6 +166,14 @@ export async function runTask(
     while (true) {
       turn += 1;
       if (turn > MAX_TOOL_TURNS) {
+        logEvent(logCtx, "task:end", {
+          dispatch: rctx.dispatchId,
+          id: task.id,
+          model: modelId,
+          status: "tool_loop_exceeded",
+          turns: turn - 1,
+          durationMs: Date.now() - start,
+        });
         return {
           taskId: task.id,
           model: modelId,
@@ -138,6 +183,20 @@ export async function runTask(
           durationMs: Date.now() - start,
           usage: lastUsage,
         };
+      }
+      // task:llm_call — only emitted at turn 2+ for tool-using tasks. Single-
+      // shot tasks (no tools) terminate after iter 1, so the leading
+      // task:start line is enough; an llm_call line on every dispatch would
+      // double the log volume for the common case. The condition `turn>1 ||
+      // built.tools.length>0` keeps the first call quiet for pure-reasoning
+      // tasks while still showing the entry for tool-using ones.
+      if (turn > 1 || built.tools.length > 0) {
+        logEvent(logCtx, "task:llm_call", {
+          dispatch: rctx.dispatchId,
+          id: task.id,
+          turn,
+          messages: messages.length,
+        });
       }
       const ctx: Context = {
         systemPrompt: "",
@@ -154,6 +213,14 @@ export async function runTask(
           ...(task.thinking !== "off" ? { reasoning: task.thinking } : {}),
         } as any);
       } catch (e: any) {
+        logEvent(logCtx, "task:end", {
+          dispatch: rctx.dispatchId,
+          id: task.id,
+          model: modelId,
+          status: "throw",
+          error: clip(e?.message ?? String(e), 200),
+          durationMs: Date.now() - start,
+        });
         return {
           taskId: task.id,
           model: modelId,
@@ -170,6 +237,16 @@ export async function runTask(
 
       // Terminal stop reasons (other than "stop"): bail with whatever text we have.
       if (msg.stopReason === "error" || msg.stopReason === "aborted" || msg.stopReason === "length") {
+        logEvent(logCtx, "task:end", {
+          dispatch: rctx.dispatchId,
+          id: task.id,
+          model: modelId,
+          status: msg.stopReason,
+          error: clip(msg.errorMessage ?? "", 200),
+          input: lastUsage?.input,
+          output: lastUsage?.output,
+          durationMs: Date.now() - start,
+        });
         return {
           taskId: task.id,
           model: modelId,
@@ -184,6 +261,16 @@ export async function runTask(
       const toolCalls = extractToolCalls(msg);
       if (toolCalls.length === 0) {
         // stopReason==="stop" with no tools → terminal success.
+        logEvent(logCtx, "task:end", {
+          dispatch: rctx.dispatchId,
+          id: task.id,
+          model: modelId,
+          status: "ok",
+          turns: turn,
+          input: lastUsage?.input,
+          output: lastUsage?.output,
+          durationMs: Date.now() - start,
+        });
         return {
           taskId: task.id,
           model: modelId,
@@ -207,6 +294,17 @@ export async function runTask(
         const tool = built.tools.find(t => t.name === call.name);
         let resultContent: any[];
         let isError = false;
+        // Per-call args summary for the log. Keep small — large prompts
+        // (e.g. write tool's `content` arg) would dwarf everything else.
+        let argSummary = "";
+        try { argSummary = clip(JSON.stringify(call.arguments ?? {}), 120); } catch { argSummary = "(unserializable)"; }
+        logEvent(logCtx, "task:tool_call", {
+          dispatch: rctx.dispatchId,
+          id: task.id,
+          turn,
+          tool: call.name,
+          args: argSummary,
+        });
         if (!tool) {
           resultContent = [{ type: "text", text: `unknown tool: ${call.name}` }];
           isError = true;
@@ -222,6 +320,21 @@ export async function runTask(
             isError = true;
           }
         }
+        // Approximate result size in chars across content blocks. Useful
+        // for spotting outsized tool outputs (a 200KB file read) without
+        // logging the bytes themselves.
+        let resultBytes = 0;
+        for (const c of resultContent) {
+          if (c?.type === "text" && typeof c.text === "string") resultBytes += c.text.length;
+        }
+        logEvent(logCtx, "task:tool_result", {
+          dispatch: rctx.dispatchId,
+          id: task.id,
+          turn,
+          tool: call.name,
+          ok: !isError,
+          bytes: resultBytes,
+        });
         messages.push({
           role: "toolResult",
           toolCallId: call.id,
@@ -234,6 +347,14 @@ export async function runTask(
       // Loop continues.
     }
   } catch (e: any) {
+    logEvent(logCtx, "task:end", {
+      dispatch: rctx.dispatchId,
+      id: task.id,
+      model: modelId,
+      status: "throw_outer",
+      error: clip(e?.message ?? String(e), 200),
+      durationMs: Date.now() - start,
+    });
     return {
       taskId: task.id,
       model: modelId,

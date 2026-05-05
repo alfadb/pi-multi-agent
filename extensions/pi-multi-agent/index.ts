@@ -39,6 +39,8 @@ import { executeEnsemble } from "./strategies/ensemble.js";
 import type { RunnerCtx } from "./runner.js";
 import { analyzeImage } from "./tools/vision-core.js";
 import { generateImage } from "./tools/imagine-core.js";
+import { logEvent, clip } from "./logger.js";
+import * as crypto from "node:crypto";
 
 // ── Tool schema ──────────────────────────────────────────────────
 
@@ -271,15 +273,71 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       strategy: StrategySchema,
-      tasks: Type.Array(TaskSchema, {
-        description: `Array of tasks to dispatch (max ${MAX_TASKS_PER_DISPATCH})`,
-        maxItems: MAX_TASKS_PER_DISPATCH,
-      }),
+      // Some pi runtimes (notably the sub2api anthropic tool-calling path)
+      // arrive at the schema validator with `tasks` already JSON-stringified
+      // — the upstream provider serialized the tool input as a single string
+      // and pi's validator then sees `string ≠ array` and rejects before
+      // execute() is reached. Accept either shape here; the execute body
+      // detects and parses the string variant. The TaskSchema array remains
+      // the canonical / LLM-facing form.
+      tasks: Type.Union(
+        [
+          Type.Array(TaskSchema, { maxItems: MAX_TASKS_PER_DISPATCH }),
+          Type.String({
+            description:
+              "Stringified JSON array of tasks (compat path — prefer the array form). " +
+              "This branch exists only for upstream providers that flatten tool inputs.",
+          }),
+        ],
+        {
+          description: `Array of tasks to dispatch (max ${MAX_TASKS_PER_DISPATCH}). Prefer raw JSON array; stringified JSON also accepted.`,
+        },
+      ),
       options: Type.Optional(DispatchOptionsSchema),
     }),
 
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const { strategy, tasks, options } = params;
+      const { strategy, options } = params;
+      let tasks: any = params.tasks;
+
+      // Compat-unwrap: when an upstream provider stringified the tasks
+      // array, decode it before validation. This restores the original
+      // shape so the rest of execute() doesn't have to branch.
+      // Bounded log so a malformed string doesn't poison the dispatch.log
+      // line length (logger already truncates, but earlier visibility is
+      // useful when triaging schema-vs-payload bugs).
+      if (typeof tasks === "string") {
+        try {
+          const parsed = JSON.parse(tasks);
+          if (Array.isArray(parsed)) {
+            logEvent(ctx.cwd, "dispatch:compat_unwrap", {
+              strategy,
+              fromType: "string",
+              tasksDecoded: parsed.length,
+              preview: clip(tasks, 80),
+            });
+            tasks = parsed;
+          } else {
+            return {
+              content: [{
+                type: "text",
+                text: `Invalid tasks payload: stringified JSON did not decode to an array (got ${typeof parsed}).`,
+              }],
+              details: { error: "tasks string did not decode to array" },
+              isError: true,
+            };
+          }
+        } catch (e: any) {
+          return {
+            content: [{
+              type: "text",
+              text: `Invalid tasks payload: tasks was a string but JSON.parse failed: ${e?.message ?? String(e)}`,
+            }],
+            details: { error: "tasks string parse failed" },
+            isError: true,
+          };
+        }
+      }
 
       if (!["parallel", "debate", "chain", "ensemble"].includes(strategy)) {
         return {
@@ -335,11 +393,44 @@ export default function (pi: ExtensionAPI) {
       // ThinkingLevel union is enforced at runtime by pi-ai, so cast here.
       const typedTasks = tasks as Task[];
 
+      // Short correlation id so dispatch.log lines can be tied to the
+      // dispatch that produced them. 8 hex = 4 bytes; collision-free for
+      // any plausible per-cwd dispatch volume.
+      const dispatchId = crypto.randomBytes(4).toString("hex");
+      const dispatchStart = Date.now();
+
+      logEvent(ctx.cwd, "dispatch:start", {
+        dispatch: dispatchId,
+        strategy,
+        tasks: typedTasks.length,
+        models: typedTasks.map(t => t.model).join(","),
+        ids: typedTasks.map(t => t.id).join(","),
+        synthesisModel: opts.synthesisModel ?? "-",
+        debateRounds: opts.debateRounds,
+        taskTimeoutMs: opts.taskTimeoutMs,
+      });
+
       const resolvedModels = await resolveModels(
         typedTasks,
         ctx.modelRegistry,
         opts.synthesisModel,
       );
+
+      // Surface unresolved models early — otherwise they only show as
+      // "Model not found" errors in per-task results, which is invisible
+      // to anyone tailing dispatch.log without context.
+      const unresolved = typedTasks
+        .filter(t => !resolvedModels.has(t.id))
+        .map(t => `${t.id}=${t.model}`);
+      if (opts.synthesisModel && !resolvedModels.has("__synthesis__")) {
+        unresolved.push(`synthesis=${opts.synthesisModel}`);
+      }
+      if (unresolved.length > 0) {
+        logEvent(ctx.cwd, "dispatch:resolve_failed", {
+          dispatch: dispatchId,
+          unresolved: unresolved.join(","),
+        });
+      }
 
       const rctx: RunnerCtx = {
         cwd: ctx.cwd,
@@ -347,6 +438,8 @@ export default function (pi: ExtensionAPI) {
         visionPrefs: config.visionModelPreferences,
         taskTimeoutMs: opts.taskTimeoutMs ?? DEFAULT_CONFIG.taskTimeoutMs,
         signal: _signal,
+        dispatchId,
+        strategy: strategy as string,
       };
 
       const result = await dispatch(
@@ -357,14 +450,34 @@ export default function (pi: ExtensionAPI) {
         rctx,
       );
 
+      // Aggregate token usage across tasks (best-effort — some providers
+      // omit usage on streaming errors).
+      let totalIn = 0, totalOut = 0;
+      for (const t of result.tasks) {
+        if (t.usage) {
+          totalIn += t.usage.input ?? 0;
+          totalOut += t.usage.output ?? 0;
+        }
+      }
+      const okCount = result.tasks.filter((t) => !t.error).length;
+      const failCount = result.tasks.filter((t) => t.error).length;
+      logEvent(ctx.cwd, "dispatch:end", {
+        dispatch: dispatchId,
+        strategy,
+        ok: okCount,
+        fail: failCount,
+        totalIn,
+        totalOut,
+        durationMs: Date.now() - dispatchStart,
+        synthesis: result.synthesis ? "yes" : "no",
+      });
+
       if (ctx.hasUI) {
         try {
-          const ok = result.tasks.filter((t) => !t.error).length;
-          const fail = result.tasks.filter((t) => t.error).length;
-          ctx.ui.setStatus("multi-agent", `🤖 ${ok}/${tasks.length} done`);
+          ctx.ui.setStatus("multi-agent", `🤖 ${okCount}/${tasks.length} done`);
           ctx.ui.notify(
-            `multi-agent: ${ok}/${tasks.length} tasks completed [${strategy}]`,
-            fail > 0 ? "warning" : "info",
+            `multi-agent: ${okCount}/${tasks.length} tasks completed [${strategy}]`,
+            failCount > 0 ? "warning" : "info",
           );
         } catch {}
       }
